@@ -41,7 +41,7 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 32_768;
 /** Absolute max output bytes. */
 export const MAX_OUTPUT_BYTES = 131_072;
 /** Default max tool calls per turn. */
-export const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 25;
+export const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 10;
 /** Minimum allowed tool calls per turn. */
 export const MIN_TOOL_CALLS_PER_TURN = 1;
 /** Maximum allowed tool calls per turn. */

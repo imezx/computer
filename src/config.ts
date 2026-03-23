@@ -93,7 +93,7 @@ export const configSchematics = createConfigSchematics()
     "numeric",
     {
       displayName: "Memory Limit (MB)",
-      subtitle: "Maximum RAM in megabytes (256–8192)",
+      subtitle: "Maximum RAM in megabytes (256-8192)",
       min: 256,
       max: 8192,
       int: true,
@@ -108,7 +108,7 @@ export const configSchematics = createConfigSchematics()
     {
       displayName: "Disk Limit (MB)",
       subtitle:
-        "Maximum disk space in megabytes (512–32768). Only enforced on new containers.",
+        "Maximum disk space in megabytes (512-32768). Only enforced on new containers.",
       min: 512,
       max: 32768,
       int: true,
@@ -138,7 +138,7 @@ export const configSchematics = createConfigSchematics()
     {
       displayName: "Max Output Size (KB)",
       subtitle:
-        "Maximum stdout/stderr returned to the model per command (1–128 KB). Larger output is truncated.",
+        "Maximum stdout/stderr returned to the model per command (1-128 KB). Larger output is truncated.",
       min: 1,
       max: 128,
       int: true,
@@ -153,13 +153,13 @@ export const configSchematics = createConfigSchematics()
     {
       displayName: "Max Tool Calls Per Turn",
       subtitle:
-        "Maximum number of times the model can use the computer per conversational turn (1-100). Resets each time you send a message. Prevents infinite loops.",
+        "Maximum number of times the model can use the computer per conversational turn (1-100). It resets each time you send a message. Prevents infinite or long loops.",
       min: 1,
       max: 100,
       int: true,
       slider: { step: 1, min: 1, max: 100 },
     },
-    25,
+    10,
   )
 
   .field(
