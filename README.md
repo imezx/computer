@@ -2,6 +2,9 @@
 
 Give your local model its own Linux CLI computer. It gets a real isolated container it can run shell commands in, write and read files, install packages, manage processes, and run background tasks - all without touching your host system.
 
+> This plugin is still in beta version, it may be not that stable.
+> This plugin is highly-inspired by the Claude's computer.
+
 ---
 
 ## Before you start
@@ -54,7 +57,7 @@ Click the gear icon next to the plugin to open settings.
 
 ### The basics
 
-**Internet Access** - off by default. Turn this on if you want the model to install packages with `apt-get`, `pip`, `npm`, etc. If you change this after the container is already running, just tell the model *"rebuild the computer"* and it will recreate with the new setting.
+**Internet Access** - `off` by **default**. Turn this `on` if you want the model to install packages with `apt-get`, `pip`, `npm`, etc. If you change this after the container is already running, just tell the model *"rebuild the computer"* and it will recreate with the new setting.
 
 **Persistence Mode** - persistent by default, meaning files and installed packages survive across sessions. Switch to ephemeral if you want a clean slate every time LM Studio opens.
 
@@ -80,35 +83,38 @@ Click the gear icon next to the plugin to open settings.
 
 ---
 
-## What the model can do?
+## What the model can do
 
 The model has access to these tools automatically - no need to ask it to use them, it figures out what's needed on its own.
 
 ### Shell
+
 | Tool | Description |
 |------|-------------|
-| **Execute** | Run shell commands in a persistent session - `cd`, `export`, `source`, and environment variables all carry over between calls |
+| **Execute** | Run shell commands in a persistent session - `cd`, `export`, `source`, `nvm use`, `conda activate` all carry over between calls, just like a real terminal |
 | **ExecuteBackground** | Start a long-running process in the background (servers, watchers, builds) and get a handle to check on it later |
 | **ReadProcessLogs** | Read buffered stdout/stderr from a background process |
 
 ### Files
+
 | Tool | Description |
 |------|-------------|
-| **WriteFile** | Create or overwrite a file |
-| **ReadFile** | Read a file, optionally a specific line range |
-| **StrReplace** | Replace an exact unique string in a file - the preferred way to edit code without rewriting the whole file |
+| **WriteFile** | Create or overwrite a complete file |
+| **ReadFile** | Read a file, optionally a specific line range to keep context short |
+| **StrReplace** | Replace an exact unique string in a file - the preferred way to edit code without rewriting the whole thing |
 | **InsertLines** | Insert lines at a specific position in a file |
 | **ListDirectory** | Browse the filesystem |
 | **UploadFile** | Copy a file from your computer into the container |
 | **DownloadFile** | Copy a file from the container to your computer |
 
 ### Container management
+
 | Tool | Preserves data | Speed | Use when |
 |------|---------------|-------|----------|
 | **ComputerStatus** | - | Instant | Check system info, resource usage, running processes |
-| **ResetShell** | V | Instant | Shell env is broken, want clean vars without touching files |
+| **ResetShell** | V | Instant | Shell env is broken, want clean variables without touching files |
 | **RestartComputer** | V | Fast | Container is sluggish, runaway process, want a fresh start |
-| **RebuildComputer** | x | Slow | Network setting changed, environment is fully broken |
+| **RebuildComputer** | X | Slow | Network setting changed, environment is fully broken |
 
 ---
 
@@ -118,9 +124,9 @@ The model has access to these tools automatically - no need to ask it to use the
 > "Write a Python script that generates a Fibonacci sequence up to 1000 and save it as fib.py"
 
 **Edit a file surgically**
-> "Fix the bug in line 42 of server.py"
+> "Fix the bug in the handle_request function in server.py"
 
-The model will read just that section of the file and replace the broken line instead of rewriting everything.
+The model reads just that section of the file and replaces only the broken part instead of rewriting everything.
 
 **Set up an environment**
 > "Set up a Node.js project with Express, create a basic REST API, and start the server"
@@ -163,6 +169,8 @@ Check that Persistence Mode is set to Persistent. Ephemeral mode wipes the conta
 ## A few things worth knowing
 
 The shell session is persistent within a conversation - `cd`, `export`, `nvm use`, `conda activate` all carry over between commands, just like a real terminal.
+
+When something goes wrong, every tool returns a short error and an actionable hint telling the model exactly what to do next - no wasted tool calls investigating the failure.
 
 The container is fully isolated and can't access anything on your host unless you configure a shared folder or port forward.
 

@@ -70,7 +70,7 @@ function readConfig(ctl) {
         diskLimitMB: c.get("diskLimitMB") ?? 4096,
         commandTimeout: c.get("commandTimeout") ?? 30,
         maxOutputSize: (c.get("maxOutputSize") ?? 32) * 1024,
-        maxToolCallsPerTurn: c.get("maxToolCallsPerTurn") ?? 25,
+        maxToolCallsPerTurn: c.get("maxToolCallsPerTurn") ?? 10,
         autoInstallPreset: c.get("autoInstallPreset") || "minimal",
         portForwards: c.get("portForwards") || "",
         hostMountPath: c.get("hostMountPath") || "",
@@ -85,7 +85,7 @@ function readConfig(ctl) {
 exports.turnBudget = {
     turnId: 0,
     callsUsed: 0,
-    maxCalls: 25,
+    maxCalls: 10,
 };
 /** Called by the preprocessor to signal a new turn. */
 function advanceTurn(maxCalls) {
@@ -100,18 +100,110 @@ function advanceTurn(maxCalls) {
 function consumeBudget() {
     exports.turnBudget.callsUsed++;
     if (exports.turnBudget.callsUsed > exports.turnBudget.maxCalls) {
-        return (`Tool call budget exhausted: you've used ${exports.turnBudget.maxCalls}/${exports.turnBudget.maxCalls} ` +
-            `calls this turn. Wait for the user's next message to continue. ` +
-            `(Configurable in plugin settings → "Max Tool Calls Per Turn")`);
+        return (`Tool call budget exhausted (${exports.turnBudget.maxCalls}/${exports.turnBudget.maxCalls}). ` +
+            `Wait for the user's next message to continue.`);
     }
     return null;
 }
-/** Return a budget status string for tool responses. */
+/** Return a budget status object for tool responses. */
 function budgetStatus() {
     return {
         callsUsed: exports.turnBudget.callsUsed,
         callsRemaining: Math.max(0, exports.turnBudget.maxCalls - exports.turnBudget.callsUsed),
         maxPerTurn: exports.turnBudget.maxCalls,
+    };
+}
+/**
+ * Classify a raw error message into a short error + actionable hint.
+ * Keeps tool responses compact — the model acts on the hint directly
+ * instead of spending tool calls investigating the failure.
+ */
+function classifyError(raw, context) {
+    const m = raw.toLowerCase();
+    const fp = context?.filePath ?? "";
+    if (m.includes("no such file") || (m.includes("not found") && fp)) {
+        const dir = fp.includes("/")
+            ? fp.slice(0, fp.lastIndexOf("/")) || "/"
+            : constants_1.CONTAINER_WORKDIR;
+        return {
+            error: `File not found: ${fp}`,
+            hint: `Use ListDirectory on "${dir}" to check what exists there.`,
+        };
+    }
+    if (m.includes("permission denied") || m.includes("eacces")) {
+        return {
+            error: `Permission denied: ${fp || raw.slice(0, 80)}`,
+            hint: `Try running with sudo, or fix permissions with: chmod +rw '${fp || "<path>"}'.`,
+        };
+    }
+    if (m.includes("is a directory")) {
+        return {
+            error: `Path is a directory, not a file: ${fp}`,
+            hint: `Use ListDirectory to browse its contents, or specify a file path.`,
+        };
+    }
+    if (m.includes("no space left") || m.includes("disk quota")) {
+        return {
+            error: "Disk full or quota exceeded.",
+            hint: `Run: df -h && du -sh /home/user/* to find what's using space.`,
+        };
+    }
+    if (m.includes("cannot allocate memory") ||
+        m.includes("out of memory") ||
+        m.includes("oom")) {
+        return {
+            error: "Out of memory.",
+            hint: `Use ComputerStatus to check memory usage. Consider increasing Memory Limit in plugin settings.`,
+        };
+    }
+    if (m.includes("command not found") ||
+        m.includes("executable file not found") ||
+        m.includes("not found in $path")) {
+        const cmd = context?.command?.split(" ")[0] ?? "the command";
+        return {
+            error: `Command not found: ${cmd}`,
+            hint: `Install it first — e.g. apt-get install ${cmd} (Ubuntu) or apk add ${cmd} (Alpine). Make sure Internet Access is enabled in settings.`,
+        };
+    }
+    if (m.includes("temporary failure resolving") ||
+        m.includes("could not resolve") ||
+        m.includes("network unreachable") ||
+        (m.includes("connection refused") && context?.isNetwork)) {
+        return {
+            error: "Network/DNS failure inside container.",
+            hint: `Internet Access may be disabled or the container was built without it. Tell the user to enable Internet Access in settings and call RebuildComputer.`,
+        };
+    }
+    if (m.includes("timed out") || m.includes("timeout")) {
+        return {
+            error: "Command timed out.",
+            hint: `For long-running tasks use ExecuteBackground instead, or increase Command Timeout in plugin settings.`,
+        };
+    }
+    if (m.includes("container") &&
+        (m.includes("not running") ||
+            m.includes("not found") ||
+            m.includes("no such container"))) {
+        return {
+            error: "Container is not running.",
+            hint: `Call ComputerStatus to wake it up, or call RebuildComputer if it keeps failing.`,
+        };
+    }
+    if (m.includes("string not found")) {
+        return {
+            error: raw.slice(0, 120),
+            hint: `Use ReadFile to view the current file content before retrying StrReplace.`,
+        };
+    }
+    if (m.includes("appears") && m.includes("times")) {
+        return {
+            error: raw.slice(0, 120),
+            hint: `Include more surrounding lines in oldStr to make the match unique.`,
+        };
+    }
+    return {
+        error: raw.length > 200 ? raw.slice(0, 200) + "…" : raw,
+        hint: `If this persists, try ResetShell or RestartComputer.`,
     };
 }
 async function ensureContainer(cfg, status) {
@@ -187,6 +279,11 @@ async function toolsProvider(ctl) {
                 if (result.truncated) {
                     status("Output was truncated (exceeded max size)");
                 }
+                const hint = result.timedOut
+                    ? classifyError("timed out", { command }).hint
+                    : result.exitCode !== 0 && result.stderr
+                        ? classifyError(result.stderr, { command }).hint
+                        : undefined;
                 return {
                     exitCode: result.exitCode,
                     stdout: result.stdout || "(no output)",
@@ -194,13 +291,15 @@ async function toolsProvider(ctl) {
                     timedOut: result.timedOut,
                     durationMs: result.durationMs,
                     truncated: result.truncated,
+                    ...(hint ? { hint } : {}),
                     budget: budgetStatus(),
                 };
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Execution failed: ${msg}`);
-                return { error: msg, exitCode: -1, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { command });
+                warn(error);
+                return { error, hint, exitCode: -1, budget: budgetStatus() };
             }
         },
     });
@@ -253,8 +352,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Write failed: ${msg}`);
-                return { error: msg, written: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { filePath });
+                warn(error);
+                return { error, hint, written: false, budget: budgetStatus() };
             }
         },
     });
@@ -303,13 +403,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Read failed: ${msg}`);
-                return {
-                    error: msg,
-                    path: filePath,
-                    hint: "Check the path is correct with ListDirectory.",
-                    budget: budgetStatus(),
-                };
+                const { error, hint } = classifyError(msg, { filePath });
+                warn(error);
+                return { error, hint, path: filePath, budget: budgetStatus() };
             }
         },
     });
@@ -354,8 +450,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`StrReplace failed: ${msg}`);
-                return { error: msg, edited: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { filePath });
+                warn(error);
+                return { error, hint, edited: false, budget: budgetStatus() };
             }
         },
     });
@@ -394,8 +491,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`InsertLines failed: ${msg}`);
-                return { error: msg, inserted: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { filePath });
+                warn(error);
+                return { error, hint, inserted: false, budget: budgetStatus() };
             }
         },
     });
@@ -436,7 +534,9 @@ async function toolsProvider(ctl) {
                 const result = await engine.exec(cmd, 10);
                 if (result.exitCode !== 0) {
                     return {
-                        error: result.stderr || "Directory not found",
+                        ...classifyError(result.stderr || "Directory not found", {
+                            filePath: target,
+                        }),
                         path: target,
                         budget: budgetStatus(),
                     };
@@ -450,7 +550,8 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                return { error: msg, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg);
+                return { error, hint, budget: budgetStatus() };
             }
         },
     });
@@ -489,8 +590,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Upload failed: ${msg}`);
-                return { error: msg, uploaded: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { filePath: hostPath });
+                warn(error);
+                return { error, hint, uploaded: false, budget: budgetStatus() };
             }
         },
     });
@@ -528,8 +630,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Download failed: ${msg}`);
-                return { error: msg, downloaded: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { filePath: containerPath });
+                warn(error);
+                return { error, hint, downloaded: false, budget: budgetStatus() };
             }
         },
     });
@@ -598,8 +701,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Status failed: ${msg}`);
-                return { error: msg, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg);
+                warn(error);
+                return { error, hint, budget: budgetStatus() };
             }
         },
     });
@@ -657,8 +761,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Rebuild failed: ${msg}`);
-                return { error: msg, rebuilt: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg);
+                warn(error);
+                return { error, hint, rebuilt: false, budget: budgetStatus() };
             }
         },
     });
@@ -721,8 +826,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Background exec failed: ${msg}`);
-                return { error: msg, started: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg, { command });
+                warn(error);
+                return { error, hint, started: false, budget: budgetStatus() };
             }
         },
     });
@@ -781,8 +887,9 @@ async function toolsProvider(ctl) {
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                warn(`Restart failed: ${msg}`);
-                return { error: msg, restarted: false, budget: budgetStatus() };
+                const { error, hint } = classifyError(msg);
+                warn(error);
+                return { error, hint, restarted: false, budget: budgetStatus() };
             }
         },
     });

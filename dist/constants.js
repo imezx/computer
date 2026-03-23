@@ -41,7 +41,7 @@ exports.DEFAULT_MAX_OUTPUT_BYTES = 32_768;
 /** Absolute max output bytes. */
 exports.MAX_OUTPUT_BYTES = 131_072;
 /** Default max tool calls per turn. */
-exports.DEFAULT_MAX_TOOL_CALLS_PER_TURN = 25;
+exports.DEFAULT_MAX_TOOL_CALLS_PER_TURN = 10;
 /** Minimum allowed tool calls per turn. */
 exports.MIN_TOOL_CALLS_PER_TURN = 1;
 /** Maximum allowed tool calls per turn. */

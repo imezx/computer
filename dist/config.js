@@ -65,7 +65,7 @@ exports.configSchematics = (0, sdk_1.createConfigSchematics)()
 }, 2)
     .field("memoryLimitMB", "numeric", {
     displayName: "Memory Limit (MB)",
-    subtitle: "Maximum RAM in megabytes (256–8192)",
+    subtitle: "Maximum RAM in megabytes (256-8192)",
     min: 256,
     max: 8192,
     int: true,
@@ -73,7 +73,7 @@ exports.configSchematics = (0, sdk_1.createConfigSchematics)()
 }, 1024)
     .field("diskLimitMB", "numeric", {
     displayName: "Disk Limit (MB)",
-    subtitle: "Maximum disk space in megabytes (512–32768). Only enforced on new containers.",
+    subtitle: "Maximum disk space in megabytes (512-32768). Only enforced on new containers.",
     min: 512,
     max: 32768,
     int: true,
@@ -89,7 +89,7 @@ exports.configSchematics = (0, sdk_1.createConfigSchematics)()
 }, 30)
     .field("maxOutputSize", "numeric", {
     displayName: "Max Output Size (KB)",
-    subtitle: "Maximum stdout/stderr returned to the model per command (1–128 KB). Larger output is truncated.",
+    subtitle: "Maximum stdout/stderr returned to the model per command (1-128 KB). Larger output is truncated.",
     min: 1,
     max: 128,
     int: true,
@@ -97,12 +97,12 @@ exports.configSchematics = (0, sdk_1.createConfigSchematics)()
 }, 32)
     .field("maxToolCallsPerTurn", "numeric", {
     displayName: "Max Tool Calls Per Turn",
-    subtitle: "Maximum number of times the model can use the computer per conversational turn (1-100). Resets each time you send a message. Prevents infinite loops.",
+    subtitle: "Maximum number of times the model can use the computer per conversational turn (1-100). It resets each time you send a message. Prevents infinite or long loops.",
     min: 1,
     max: 100,
     int: true,
     slider: { step: 1, min: 1, max: 100 },
-}, 25)
+}, 10)
     .field("autoInstallPreset", "select", {
     displayName: "Auto-Install Packages",
     subtitle: "Pre-install common tools when the container is first created",
