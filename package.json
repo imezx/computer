@@ -1,7 +1,7 @@
 {
   "name": "lms-plugin-computer",
   "version": "0.1.0",
-  "description": "Gives your local LLM its own dedicated Linux CLI computer - a fully isolated Docker/Podman container with shell access, file operations, internet toggle, resource limits, and per-turn tool call budgets. The model can install packages, write & run code, manage processes, and transfer files — all without ever touching your host system.",
+  "description": "Give your local model its own Linux CLI computer. It gets a real isolated container it can run shell commands in, write and read files, install packages, manage processes, and run background tasks - all without touching your host system.",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
