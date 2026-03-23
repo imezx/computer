@@ -1,0 +1,21 @@
+{
+  "name": "lms-plugin-computer",
+  "version": "0.1.0",
+  "description": "Gives your local LLM its own dedicated Linux CLI computer - a fully isolated Docker/Podman container with shell access, file operations, internet toggle, resource limits, and per-turn tool call budgets. The model can install packages, write & run code, manage processes, and transfer files — all without ever touching your host system.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && lms dev",
+    "push": "lms push"
+  },
+  "author": "khtsly",
+  "license": "MIT",
+  "dependencies": {
+    "@lmstudio/sdk": "^1.5.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.8",
+    "typescript": "^5.4.5"
+  }
+}
