@@ -1,1 +1,0 @@
-{"version":3,"file":"guard.d.ts","sourceRoot":"","sources":["../../src/safety/guard.ts"],"names":[],"mappings":"AAAA;;;;;;;GAOG;AAIH,gCAAgC;AAChC,MAAM,WAAW,iBAAiB;IAChC,OAAO,EAAE,OAAO,CAAC;IACjB,MAAM,CAAC,EAAE,MAAM,CAAC;CACjB;AAgBD;;GAEG;AACH,wBAAgB,YAAY,CAC1B,OAAO,EAAE,MAAM,EACf,UAAU,EAAE,OAAO,GAClB,iBAAiB,CAqCnB"}
