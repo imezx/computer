@@ -40,7 +40,13 @@ function getRuntimeCandidates() {
         { cmd: "podman", kind: "podman" },
     ];
     if (process.platform === "win32") {
-        candidates.push({ cmd: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe", kind: "docker" }, { cmd: "C:\\Program Files\\Docker\\Docker\\resources\\docker.exe", kind: "docker" });
+        candidates.push({
+            cmd: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+            kind: "docker",
+        }, {
+            cmd: "C:\\Program Files\\Docker\\Docker\\resources\\docker.exe",
+            kind: "docker",
+        });
     }
     return candidates;
 }

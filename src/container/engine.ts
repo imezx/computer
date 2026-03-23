@@ -133,11 +133,160 @@ let containerReady: boolean = false;
 let currentNetwork: NetworkMode = "none";
 let initPromise: Promise<void> | null = null;
 
+interface ShellSession {
+  proc: ReturnType<typeof spawn>;
+  write: (data: string) => void;
+  kill: () => void;
+}
+
+let shellSession: ShellSession | null = null;
+
+const SENTINEL = `__LMS_DONE_${Math.random().toString(36).slice(2)}__`;
+const SENTINEL_NL = SENTINEL + "\n";
+
 /**
  * Get the shell path for the given image.
  */
 function shellFor(image: string): string {
   return image.startsWith("alpine") ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
+}
+
+/**
+ * Start a persistent bash session inside the container.
+ * The session stays alive across multiple Execute calls so that
+ * cd, export, source, nvm use, conda activate, etc. all persist.
+ */
+function startShellSession(): ShellSession {
+  if (!runtime) throw new Error("Runtime not initialized");
+
+  const isAlpine = containerName.includes("alpine");
+  const shell = isAlpine ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
+
+  const proc = spawn(
+    runtime.path,
+    ["exec", "-i", "-w", CONTAINER_WORKDIR, containerName, shell],
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: getRuntimeEnv(),
+    },
+  );
+
+  const init = [
+    "export PS1=''",
+    "export PS2=''",
+    "export TERM=xterm-256color",
+    `cd ${CONTAINER_WORKDIR}`,
+    "",
+  ].join("\n");
+  proc.stdin?.write(init);
+
+  const session: ShellSession = {
+    proc,
+    write: (data: string) => proc.stdin?.write(data),
+    kill: () => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+
+  proc.on("exit", () => {
+    if (shellSession === session) shellSession = null;
+  });
+
+  proc.on("error", () => {
+    if (shellSession === session) shellSession = null;
+  });
+
+  return session;
+}
+
+/**
+ * Execute a command through the persistent shell session.
+ * State (cwd, env vars, sourced files) persists across calls.
+ */
+async function execInSession(
+  command: string,
+  timeoutSeconds: number,
+  maxOutputBytes: number,
+): Promise<ExecResult> {
+  if (
+    !shellSession ||
+    shellSession.proc.exitCode !== null ||
+    shellSession.proc.killed
+  ) {
+    shellSession = startShellSession();
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const session = shellSession;
+  const start = Date.now();
+  const effectiveMax = Math.min(maxOutputBytes, MAX_OUTPUT_BYTES);
+
+  return new Promise<ExecResult>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+
+    const cleanup = () => {
+      session.proc.stdout?.removeListener("data", onStdout);
+      session.proc.stderr?.removeListener("data", onStderr);
+      clearTimeout(timer);
+    };
+
+    const finish = (timedOut: boolean, killed: boolean) => {
+      if (done) return;
+      done = true;
+      cleanup();
+
+      let exitCode = 0;
+      const exitMatch = stdout.match(/\nEXIT_CODE:(\d+)\n?$/);
+      if (exitMatch) {
+        exitCode = parseInt(exitMatch[1], 10);
+        stdout = stdout.slice(0, exitMatch.index);
+      }
+
+      stdout = stdout.replace(new RegExp(SENTINEL + "\\n?$"), "").trimEnd();
+
+      resolve({
+        exitCode: killed ? 137 : exitCode,
+        stdout: stdout.slice(0, effectiveMax),
+        stderr: stderr.slice(0, effectiveMax),
+        timedOut,
+        durationMs: Date.now() - start,
+        truncated:
+          stdout.length >= effectiveMax || stderr.length >= effectiveMax,
+      });
+    };
+
+    const onStdout = (chunk: Buffer) => {
+      if (done) return;
+      stdout += chunk.toString("utf-8");
+      if (stdout.includes(SENTINEL_NL) || stdout.endsWith(SENTINEL)) {
+        finish(false, false);
+      }
+    };
+
+    const onStderr = (chunk: Buffer) => {
+      if (done) return;
+      if (stderr.length < effectiveMax) stderr += chunk.toString("utf-8");
+    };
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      session.kill();
+      shellSession = null;
+      finish(true, true);
+    }, timeoutSeconds * 1000);
+
+    session.proc.stdout?.on("data", onStdout);
+    session.proc.stderr?.on("data", onStderr);
+
+    const wrapped = `${command}\necho "EXIT_CODE:$?"\necho "${SENTINEL}"\n`;
+    session.write(wrapped);
+  });
 }
 
 /**
@@ -290,10 +439,14 @@ export async function ensureReady(opts: {
     currentNetwork = "none";
     try {
       await run(["stop", containerName], 15_000);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     try {
       await run(["rm", "-f", containerName], 10_000);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
   }
   if (initPromise) return initPromise;
 
@@ -318,7 +471,9 @@ export async function ensureReady(opts: {
         ]);
         const actualNet = netOut.trim().toLowerCase();
         actuallyHasNetwork = actualNet !== "none" && actualNet !== "";
-      } catch {}
+      } catch {
+        /* assume no network */
+      }
 
       const wantsNetwork = opts.network !== "none";
 
@@ -333,10 +488,14 @@ export async function ensureReady(opts: {
       );
       try {
         await run(["stop", containerName], 15_000);
-      } catch {}
+      } catch {
+        /* already stopped */
+      }
       try {
         await run(["rm", "-f", containerName], 10_000);
-      } catch {}
+      } catch {
+        /* already gone */
+      }
     }
 
     if (state === "stopped") {
@@ -354,7 +513,9 @@ export async function ensureReady(opts: {
         ) {
           try {
             await run(["rm", "-f", containerName], 10_000);
-          } catch {}
+          } catch {
+            /* ignore */
+          }
         } else {
           throw err;
         }
@@ -431,7 +592,9 @@ export async function ensureReady(opts: {
           ["network", "disconnect", setupNetwork, containerName],
           10_000,
         );
-      } catch {}
+      } catch {
+        /* best effort — container still works, just has network */
+      }
     }
 
     currentNetwork = setupNetwork !== "none" ? opts.network : "none";
@@ -458,78 +621,12 @@ export async function exec(
     throw new Error("Container not ready. Call ensureReady() first.");
   }
 
-  const start = Date.now();
-  const cwd = workdir ?? CONTAINER_WORKDIR;
-  const shell = containerName.includes("alpine")
-    ? CONTAINER_SHELL_ALPINE
-    : CONTAINER_SHELL;
+  const cmdToRun =
+    workdir && workdir !== CONTAINER_WORKDIR
+      ? `cd ${workdir} && ${command}`
+      : command;
 
-  return new Promise<ExecResult>((resolve) => {
-    const args = ["exec", "-w", cwd, containerName, shell, "-c", command];
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let killed = false;
-
-    const proc = spawn(runtime!.path, args, {
-      timeout: timeoutSeconds * 1000,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: getRuntimeEnv(),
-    });
-
-    const effectiveMax = Math.min(maxOutputBytes, MAX_OUTPUT_BYTES);
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      if (stdout.length < effectiveMax) {
-        stdout += chunk.toString("utf-8");
-      }
-    });
-
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < effectiveMax) {
-        stderr += chunk.toString("utf-8");
-      }
-    });
-
-    const timer = setTimeout(
-      () => {
-        timedOut = true;
-        killed = true;
-        proc.kill("SIGKILL");
-      },
-      timeoutSeconds * 1000 + 500,
-    );
-
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      const durationMs = Date.now() - start;
-
-      const stdoutTruncated = stdout.length >= effectiveMax;
-      const stderrTruncated = stderr.length >= effectiveMax;
-
-      resolve({
-        exitCode: code ?? (killed ? 137 : 1),
-        stdout: stdout.slice(0, effectiveMax),
-        stderr: stderr.slice(0, effectiveMax),
-        timedOut,
-        durationMs,
-        truncated: stdoutTruncated || stderrTruncated,
-      });
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: 1,
-        stdout: "",
-        stderr: err.message,
-        timedOut: false,
-        durationMs: Date.now() - start,
-        truncated: false,
-      });
-    });
-  });
+  return execInSession(cmdToRun, timeoutSeconds, maxOutputBytes);
 }
 
 /**
@@ -568,39 +665,199 @@ export async function writeFile(
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
-
     proc.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`Write failed (exit ${code}): ${stderr}`));
     });
-
     proc.on("error", reject);
-
     proc.stdin?.write(content);
     proc.stdin?.end();
   });
 }
 
 /**
- * Read a file from the container.
+ * Read a file from the container, optionally limited to a line range.
  */
 export async function readFile(
   filePath: string,
   maxBytes: number,
-): Promise<string> {
+  startLine?: number,
+  endLine?: number,
+): Promise<{ content: string; totalLines: number }> {
   if (!runtime || !containerReady) {
     throw new Error("Container not ready.");
   }
 
-  const result = await exec(
-    `cat '${filePath.replace(/'/g, "'\\''")}'`,
-    10,
-    maxBytes,
-  );
+  const q = filePath.replace(/'/g, "'\\''");
+  const totalResult = await exec(`wc -l < '${q}' 2>/dev/null || echo 0`, 5);
+  const totalLines = parseInt(totalResult.stdout.trim(), 10) || 0;
+
+  let cmd: string;
+  if (startLine !== undefined && endLine !== undefined) {
+    cmd = `sed -n '${startLine},${endLine}p' '${q}'`;
+  } else if (startLine !== undefined) {
+    cmd = `tail -n +${startLine} '${q}'`;
+  } else {
+    cmd = `cat '${q}'`;
+  }
+
+  const result = await exec(cmd, 10, maxBytes);
   if (result.exitCode !== 0) {
     throw new Error(`Read failed: ${result.stderr || "file not found"}`);
   }
-  return result.stdout;
+  return { content: result.stdout, totalLines };
+}
+
+/**
+ * Replace an exact string in a file. Fails if the string is not found
+ * or appears more than once, matching the behaviour of surgical editors.
+ */
+export async function strReplaceInFile(
+  filePath: string,
+  oldStr: string,
+  newStr: string,
+): Promise<{ replacements: number }> {
+  if (!runtime || !containerReady) {
+    throw new Error("Container not ready.");
+  }
+
+  const q = filePath.replace(/'/g, "'\\''");
+  const readResult = await exec(`cat '${q}'`, 10, MAX_OUTPUT_BYTES);
+  if (readResult.exitCode !== 0) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  const original = readResult.stdout;
+  const occurrences = original.split(oldStr).length - 1;
+
+  if (occurrences === 0) {
+    throw new Error(
+      `String not found in ${filePath}.\n` +
+        `Hint: use ReadFile to view the current contents before editing.`,
+    );
+  }
+  if (occurrences > 1) {
+    throw new Error(
+      `String appears ${occurrences} times in ${filePath} — it must be unique.\n` +
+        `Hint: include more surrounding context to make the match unique.`,
+    );
+  }
+
+  const updated = original.replace(oldStr, newStr);
+  await writeFile(filePath, updated);
+  return { replacements: 1 };
+}
+
+/**
+ * Insert lines into a file at a given line number.
+ * Line numbers are 1-based. Pass 0 to prepend, or a number past EOF to append.
+ */
+export async function insertLinesInFile(
+  filePath: string,
+  afterLine: number,
+  content: string,
+): Promise<void> {
+  if (!runtime || !containerReady) {
+    throw new Error("Container not ready.");
+  }
+
+  const q = filePath.replace(/'/g, "'\\''");
+  const readResult = await exec(`cat '${q}'`, 10, MAX_OUTPUT_BYTES);
+  if (readResult.exitCode !== 0) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  const lines = readResult.stdout.split("\n");
+  const insertLines = content.split("\n");
+  const clampedLine = Math.max(0, Math.min(afterLine, lines.length));
+  lines.splice(clampedLine, 0, ...insertLines);
+  await writeFile(filePath, lines.join("\n"));
+}
+
+const bgLogs = new Map<
+  number,
+  { stdout: string; stderr: string; done: boolean; exitCode: number | null }
+>();
+
+/**
+ * Run a command in the background inside the container.
+ * Returns a handle ID that can be used with readBgLogs.
+ */
+export async function execBackground(
+  command: string,
+  timeoutSeconds: number,
+): Promise<{ handleId: number; pid: number }> {
+  if (!runtime || !containerReady) {
+    throw new Error("Container not ready.");
+  }
+
+  const shell = containerName.includes("alpine")
+    ? CONTAINER_SHELL_ALPINE
+    : CONTAINER_SHELL;
+  const handleId = Date.now();
+  const entry = {
+    stdout: "",
+    stderr: "",
+    done: false,
+    exitCode: null as number | null,
+  };
+  bgLogs.set(handleId, entry);
+
+  const proc = spawn(
+    runtime.path,
+    ["exec", containerName, shell, "-c", command],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: getRuntimeEnv(),
+    },
+  );
+
+  const cap = MAX_OUTPUT_BYTES * 2;
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    if (entry.stdout.length < cap) entry.stdout += chunk.toString("utf-8");
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    if (entry.stderr.length < cap) entry.stderr += chunk.toString("utf-8");
+  });
+  proc.on("close", (code) => {
+    entry.done = true;
+    entry.exitCode = code;
+  });
+
+  setTimeout(() => {
+    if (!entry.done) {
+      proc.kill("SIGKILL");
+      entry.done = true;
+      entry.exitCode = 137;
+    }
+  }, timeoutSeconds * 1_000);
+
+  return { handleId, pid: proc.pid ?? -1 };
+}
+
+/**
+ * Read buffered output from a background process by handle ID.
+ */
+export function readBgLogs(
+  handleId: number,
+  maxBytes: number = DEFAULT_MAX_OUTPUT_BYTES,
+): {
+  stdout: string;
+  stderr: string;
+  done: boolean;
+  exitCode: number | null;
+  found: boolean;
+} {
+  const entry = bgLogs.get(handleId);
+  if (!entry)
+    return { stdout: "", stderr: "", done: true, exitCode: null, found: false };
+  return {
+    stdout: entry.stdout.slice(-maxBytes),
+    stderr: entry.stderr.slice(-maxBytes),
+    done: entry.done,
+    exitCode: entry.exitCode,
+    found: true,
+  };
 }
 
 /**
@@ -753,14 +1010,23 @@ export async function killProcess(
 export async function stopContainer(remove: boolean = false): Promise<void> {
   if (!runtime) return;
 
+  if (shellSession) {
+    shellSession.kill();
+    shellSession = null;
+  }
+
   try {
     await run(["stop", containerName], 15_000);
-  } catch {}
+  } catch {
+    /* already stopped */
+  }
 
   if (remove) {
     try {
       await run(["rm", "-f", containerName], 10_000);
-    } catch {}
+    } catch {
+      /* already removed */
+    }
   }
 
   containerReady = false;
@@ -774,6 +1040,24 @@ export async function destroyContainer(): Promise<void> {
   containerReady = false;
   currentNetwork = "none";
   initPromise = null;
+}
+
+/**
+ * Restart the container without wiping its data.
+ * Stops the running container, kills the shell session, then starts it again.
+ * Faster than a full rebuild — filesystem and installed packages are preserved.
+ */
+export async function restartContainer(): Promise<void> {
+  if (!runtime) throw new Error("Runtime not initialized.");
+  if (shellSession) {
+    shellSession.kill();
+    shellSession = null;
+  }
+  try {
+    await run(["stop", containerName], 15_000);
+  } catch {}
+  await run(["start", containerName], 30_000);
+  containerReady = true;
 }
 
 /**
@@ -873,7 +1157,9 @@ export async function updateNetwork(
     if (opts.persistenceMode === "persistent") {
       try {
         await run(["commit", containerName, tempImage], 60_000);
-      } catch {}
+      } catch {
+        /* best effort */
+      }
     }
 
     await destroyContainer();
@@ -888,7 +1174,9 @@ export async function updateNetwork(
     if (opts.persistenceMode === "persistent") {
       try {
         await run(["rmi", tempImage], 10_000);
-      } catch {}
+      } catch {
+        /* best effort */
+      }
     }
   }
 }
@@ -898,6 +1186,18 @@ export async function updateNetwork(
  */
 export function isReady(): boolean {
   return containerReady;
+}
+
+/**
+ * Reset the persistent shell session without touching the container.
+ * Useful when the model wants a clean shell (fresh env vars, back to home dir)
+ * without a full container rebuild.
+ */
+export function resetShellSession(): void {
+  if (shellSession) {
+    shellSession.kill();
+    shellSession = null;
+  }
 }
 
 /**
@@ -912,10 +1212,18 @@ export async function verifyHealth(): Promise<void> {
     if (state !== "running") {
       containerReady = false;
       currentNetwork = "none";
+      if (shellSession) {
+        shellSession.kill();
+        shellSession = null;
+      }
     }
   } catch {
     containerReady = false;
     currentNetwork = "none";
+    if (shellSession) {
+      shellSession.kill();
+      shellSession = null;
+    }
   }
 }
 

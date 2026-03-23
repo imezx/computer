@@ -15,6 +15,10 @@ exports.ensureReady = ensureReady;
 exports.exec = exec;
 exports.writeFile = writeFile;
 exports.readFile = readFile;
+exports.strReplaceInFile = strReplaceInFile;
+exports.insertLinesInFile = insertLinesInFile;
+exports.execBackground = execBackground;
+exports.readBgLogs = readBgLogs;
 exports.copyToContainer = copyToContainer;
 exports.copyFromContainer = copyFromContainer;
 exports.getEnvironmentInfo = getEnvironmentInfo;
@@ -22,9 +26,11 @@ exports.listProcesses = listProcesses;
 exports.killProcess = killProcess;
 exports.stopContainer = stopContainer;
 exports.destroyContainer = destroyContainer;
+exports.restartContainer = restartContainer;
 exports.getContainerInfo = getContainerInfo;
 exports.updateNetwork = updateNetwork;
 exports.isReady = isReady;
+exports.resetShellSession = resetShellSession;
 exports.verifyHealth = verifyHealth;
 exports.getContainerName = getContainerName;
 const child_process_1 = require("child_process");
@@ -43,7 +49,6 @@ const execAsync = (0, util_1.promisify)(child_process_1.execFile);
 function toDockerPath(hostPath) {
     if (process.platform !== "win32")
         return hostPath;
-    // Replace drive letter C:\ → //c/
     return hostPath
         .replace(/^([A-Za-z]):\\/, (_, d) => `//${d.toLowerCase()}/`)
         .replace(/\\/g, "/");
@@ -60,7 +65,13 @@ function getRuntimeEnv() {
             "C:\\Program Files\\Docker\\Docker\\resources\\bin",
             "C:\\Program Files\\Docker\\Docker\\resources",
         ]
-        : ["/usr/bin", "/usr/local/bin", "/usr/lib/podman", "/usr/libexec/podman", "/bin"];
+        : [
+            "/usr/bin",
+            "/usr/local/bin",
+            "/usr/lib/podman",
+            "/usr/libexec/podman",
+            "/bin",
+        ];
     const sep = process.platform === "win32" ? ";" : ":";
     return {
         ...process.env,
@@ -86,16 +97,12 @@ function ensurePodmanConfig() {
             return;
         (0, fs_1.mkdirSync)(configDir, { recursive: true });
         let updated = existing;
-        // helper_binaries_dir tells Podman where to find slirp4netns/pasta
-        // even when LM Studio's process has a restricted PATH.
         if (needsHelperDir) {
             const helperLine = 'helper_binaries_dir = ["/usr/bin", "/usr/local/bin", "/usr/lib/podman"]';
             updated = updated.includes("[network]")
                 ? updated.replace("[network]", `[network]\n${helperLine}`)
                 : updated + `\n[network]\n${helperLine}\n`;
         }
-        // dns_servers bypasses systemd-resolved's 127.0.0.53 stub which
-        // is unreachable from inside rootless containers.
         if (needsDNS) {
             const dnsLine = 'dns_servers = ["8.8.8.8", "8.8.4.4"]';
             updated = updated.includes("[containers]")
@@ -109,17 +116,134 @@ function ensurePodmanConfig() {
         console.warn("[lms-computer] Could not write Podman config:", err);
     }
 }
-// ─── Singleton State ────────────────────────────────────────────
 let runtime = null;
 let containerName = "";
 let containerReady = false;
 let currentNetwork = "none";
 let initPromise = null;
+let shellSession = null;
+const SENTINEL = `__LMS_DONE_${Math.random().toString(36).slice(2)}__`;
+const SENTINEL_NL = SENTINEL + "\n";
 /**
  * Get the shell path for the given image.
  */
 function shellFor(image) {
     return image.startsWith("alpine") ? constants_1.CONTAINER_SHELL_ALPINE : constants_1.CONTAINER_SHELL;
+}
+/**
+ * Start a persistent bash session inside the container.
+ * The session stays alive across multiple Execute calls so that
+ * cd, export, source, nvm use, conda activate, etc. all persist.
+ */
+function startShellSession() {
+    if (!runtime)
+        throw new Error("Runtime not initialized");
+    const isAlpine = containerName.includes("alpine");
+    const shell = isAlpine ? constants_1.CONTAINER_SHELL_ALPINE : constants_1.CONTAINER_SHELL;
+    const proc = (0, child_process_1.spawn)(runtime.path, ["exec", "-i", "-w", constants_1.CONTAINER_WORKDIR, containerName, shell], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: getRuntimeEnv(),
+    });
+    const init = [
+        "export PS1=''",
+        "export PS2=''",
+        "export TERM=xterm-256color",
+        `cd ${constants_1.CONTAINER_WORKDIR}`,
+        "",
+    ].join("\n");
+    proc.stdin?.write(init);
+    const session = {
+        proc,
+        write: (data) => proc.stdin?.write(data),
+        kill: () => {
+            try {
+                proc.kill("SIGKILL");
+            }
+            catch {
+                /* ignore */
+            }
+        },
+    };
+    proc.on("exit", () => {
+        if (shellSession === session)
+            shellSession = null;
+    });
+    proc.on("error", () => {
+        if (shellSession === session)
+            shellSession = null;
+    });
+    return session;
+}
+/**
+ * Execute a command through the persistent shell session.
+ * State (cwd, env vars, sourced files) persists across calls.
+ */
+async function execInSession(command, timeoutSeconds, maxOutputBytes) {
+    if (!shellSession ||
+        shellSession.proc.exitCode !== null ||
+        shellSession.proc.killed) {
+        shellSession = startShellSession();
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    const session = shellSession;
+    const start = Date.now();
+    const effectiveMax = Math.min(maxOutputBytes, constants_1.MAX_OUTPUT_BYTES);
+    return new Promise((resolve) => {
+        let stdout = "";
+        let stderr = "";
+        let done = false;
+        const cleanup = () => {
+            session.proc.stdout?.removeListener("data", onStdout);
+            session.proc.stderr?.removeListener("data", onStderr);
+            clearTimeout(timer);
+        };
+        const finish = (timedOut, killed) => {
+            if (done)
+                return;
+            done = true;
+            cleanup();
+            let exitCode = 0;
+            const exitMatch = stdout.match(/\nEXIT_CODE:(\d+)\n?$/);
+            if (exitMatch) {
+                exitCode = parseInt(exitMatch[1], 10);
+                stdout = stdout.slice(0, exitMatch.index);
+            }
+            stdout = stdout.replace(new RegExp(SENTINEL + "\\n?$"), "").trimEnd();
+            resolve({
+                exitCode: killed ? 137 : exitCode,
+                stdout: stdout.slice(0, effectiveMax),
+                stderr: stderr.slice(0, effectiveMax),
+                timedOut,
+                durationMs: Date.now() - start,
+                truncated: stdout.length >= effectiveMax || stderr.length >= effectiveMax,
+            });
+        };
+        const onStdout = (chunk) => {
+            if (done)
+                return;
+            stdout += chunk.toString("utf-8");
+            if (stdout.includes(SENTINEL_NL) || stdout.endsWith(SENTINEL)) {
+                finish(false, false);
+            }
+        };
+        const onStderr = (chunk) => {
+            if (done)
+                return;
+            if (stderr.length < effectiveMax)
+                stderr += chunk.toString("utf-8");
+        };
+        const timer = setTimeout(() => {
+            if (done)
+                return;
+            session.kill();
+            shellSession = null;
+            finish(true, true);
+        }, timeoutSeconds * 1000);
+        session.proc.stdout?.on("data", onStdout);
+        session.proc.stderr?.on("data", onStderr);
+        const wrapped = `${command}\necho "EXIT_CODE:$?"\necho "${SENTINEL}"\n`;
+        session.write(wrapped);
+    });
 }
 /**
  * Run a container runtime command and return stdout.
@@ -140,8 +264,10 @@ async function run(args, timeoutMs = 30_000) {
 async function getContainerState() {
     try {
         const out = await run([
-            "inspect", containerName,
-            "--format", "{{.State.Status}}",
+            "inspect",
+            containerName,
+            "--format",
+            "{{.State.Status}}",
         ]);
         const status = out.trim().toLowerCase();
         if (status === "running")
@@ -159,47 +285,37 @@ async function getContainerState() {
  */
 function buildRunArgs(opts) {
     const args = [
-        "run", "-d",
-        "--name", opts.name,
-        "--hostname", "lms-computer",
-        // For Podman rootless with internet enabled, omit --network entirely so Podman
-        // uses its own configured default (respects ~/.config/containers/containers.conf
-        // dns_servers). Passing --network bridge fails without kernel privileges.
-        // For Docker or network=none, pass the flag explicitly.
+        "run",
+        "-d",
+        "--name",
+        opts.name,
+        "--hostname",
+        "lms-computer",
         ...(opts.network !== "podman-default" ? ["--network", opts.network] : []),
-        // Inject explicit DNS servers to bypass systemd-resolved's 127.0.0.53 stub
-        // which is unreachable from inside rootless containers.
-        ...(opts.network !== "none" ? ["--dns", "8.8.8.8", "--dns", "8.8.4.4"] : []),
-        // Use /root as the initial workdir — it always exists in any base image.
-        // The real workdir (/home/user) is created later by setupContainer.
-        // Podman (unlike Docker) validates the workdir at start time, so we must
-        // start with a directory that is guaranteed to exist.
-        "-w", "/root",
+        ...(opts.network !== "none"
+            ? ["--dns", "8.8.8.8", "--dns", "8.8.4.4"]
+            : []),
+        "-w",
+        "/root",
     ];
-    // Resource limits
     if (opts.cpuLimit > 0) {
         args.push("--cpus", String(opts.cpuLimit));
     }
     if (opts.memoryLimitMB > 0) {
         args.push("--memory", `${opts.memoryLimitMB}m`);
-        // Set swap equal to memory (prevents OOM-killer weirdness)
         args.push("--memory-swap", `${opts.memoryLimitMB}m`);
     }
-    // Environment variables
     for (const [k, v] of Object.entries(opts.envVars)) {
         args.push("-e", `${k}=${v}`);
     }
-    // Port forwards
     for (const pf of opts.portForwards) {
         const trimmed = pf.trim();
         if (trimmed)
             args.push("-p", trimmed);
     }
-    // Host mount
     if (opts.hostMountPath) {
         args.push("-v", `${toDockerPath(opts.hostMountPath)}:/mnt/shared`);
     }
-    // Keep the container alive with a sleep loop
     args.push(opts.image, "tail", "-f", "/dev/null");
     return args;
 }
@@ -208,14 +324,15 @@ function buildRunArgs(opts) {
  */
 async function setupContainer(image, preset, hasNetwork = false) {
     const shell = shellFor(image);
-    // Create the working directory and a non-root user
-    await run(["exec", containerName, shell, "-c",
+    await run([
+        "exec",
+        containerName,
+        shell,
+        "-c",
         `mkdir -p ${constants_1.CONTAINER_WORKDIR} && ` +
             `(id user >/dev/null 2>&1 || adduser --disabled-password --gecos "" --home ${constants_1.CONTAINER_WORKDIR} user 2>/dev/null || ` +
             `adduser -D -h ${constants_1.CONTAINER_WORKDIR} user 2>/dev/null || true)`,
     ], 15_000);
-    // Install packages if a preset is selected and the container has network access.
-    // Skip silently if network is none — user can enable Internet Access in settings.
     if (preset && preset !== "none" && hasNetwork) {
         const isAlpine = image.startsWith("alpine");
         const presets = isAlpine ? constants_1.PACKAGE_PRESETS_ALPINE : constants_1.PACKAGE_PRESETS;
@@ -224,9 +341,6 @@ async function setupContainer(image, preset, hasNetwork = false) {
             const installCmd = isAlpine
                 ? `apk update && apk add --no-cache ${packages.join(" ")}`
                 : `apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${packages.join(" ")} && apt-get clean && rm -rf /var/lib/apt/lists/*`;
-            // This can take a while, especially for the 'full' preset
-            // Non-fatal: if the install fails (e.g. transient network issue), log and continue.
-            // The model can install packages manually once the container is running.
             try {
                 await run(["exec", containerName, shell, "-c", installCmd], 180_000);
             }
@@ -236,115 +350,109 @@ async function setupContainer(image, preset, hasNetwork = false) {
         }
     }
 }
-// ─── Public API ─────────────────────────────────────────────────
 /**
  * Initialize the container engine: detect runtime, create or start
  * the container if needed. Safe to call multiple times (idempotent).
  */
 async function ensureReady(opts) {
     if (containerReady) {
-        // Container is running — currentNetwork was set when it was created or last inspected.
-        // If the desired network matches, nothing to do.
         const wantsNetwork = opts.network !== "none";
         const hasNetwork = currentNetwork !== "none";
         if (wantsNetwork === hasNetwork)
             return;
-        // Network mismatch on a hot container — tear it down and let initPromise recreate it.
         containerReady = false;
         currentNetwork = "none";
         try {
             await run(["stop", containerName], 15_000);
         }
-        catch { /* ignore */ }
+        catch {
+            /* ignore */
+        }
         try {
             await run(["rm", "-f", containerName], 10_000);
         }
-        catch { /* ignore */ }
-        // Fall through to normal init below
+        catch {
+            /* ignore */
+        }
     }
     if (initPromise)
         return initPromise;
     initPromise = (async () => {
-        // Detect runtime
         runtime = await (0, runtime_1.detectRuntime)();
         containerName = `${constants_1.CONTAINER_NAME_PREFIX}-main`;
-        // Auto-configure DNS for Podman rootless (fixes systemd-resolved stub issue)
         if (runtime.kind === "podman") {
             ensurePodmanConfig();
         }
         const state = await getContainerState();
         if (state === "running") {
-            // Read the actual network mode from the running container.
-            // Podman returns "slirp4netns", "pasta", or "podman" for enabled networks;
-            // Docker returns "bridge". We normalise to "none" vs "enabled".
             let actuallyHasNetwork = false;
             try {
-                const netOut = await run(["inspect", containerName, "--format", "{{.HostConfig.NetworkMode}}"]);
+                const netOut = await run([
+                    "inspect",
+                    containerName,
+                    "--format",
+                    "{{.HostConfig.NetworkMode}}",
+                ]);
                 const actualNet = netOut.trim().toLowerCase();
                 actuallyHasNetwork = actualNet !== "none" && actualNet !== "";
             }
-            catch { /* assume no network */ }
+            catch {
+                /* assume no network */
+            }
             const wantsNetwork = opts.network !== "none";
             if (actuallyHasNetwork === wantsNetwork) {
-                // Network matches — nothing to do.
                 currentNetwork = wantsNetwork ? opts.network : "none";
                 containerReady = true;
                 return;
             }
-            // Network mismatch — must recreate the container.
-            // (Podman rootless can't change network on a running container;
-            //  Docker could use network connect/disconnect but recreating is simpler and reliable.)
             console.log(`[lms-computer] Network mismatch (container has ${actuallyHasNetwork ? "internet" : "no internet"}, settings want ${wantsNetwork ? "internet" : "no internet"}) — recreating container.`);
             try {
                 await run(["stop", containerName], 15_000);
             }
-            catch { /* already stopped */ }
+            catch {
+                /* already stopped */
+            }
             try {
                 await run(["rm", "-f", containerName], 10_000);
             }
-            catch { /* already gone */ }
-            // Fall through to container creation below
+            catch {
+                /* already gone */
+            }
         }
         if (state === "stopped") {
-            // Start existing stopped container.
-            // If it fails (e.g. a previous creation attempt left a broken container
-            // whose workdir was never created), remove it and fall through to recreate.
             try {
                 await run(["start", containerName]);
                 containerReady = true;
-                // We don't know what network it was started with — leave currentNetwork as-is
-                // and let the network-sync logic below handle any mismatch.
                 return;
             }
             catch (err) {
                 const msg = err?.message ?? "";
-                if (msg.includes("workdir") || msg.includes("does not exist") || msg.includes("netns") || msg.includes("mount runtime")) {
-                    // Broken container — remove it and recreate cleanly below
+                if (msg.includes("workdir") ||
+                    msg.includes("does not exist") ||
+                    msg.includes("netns") ||
+                    msg.includes("mount runtime")) {
                     try {
                         await run(["rm", "-f", containerName], 10_000);
                     }
-                    catch { /* ignore */ }
+                    catch {
+                        /* ignore */
+                    }
                 }
                 else {
                     throw err;
                 }
             }
         }
-        // Container not found — pull image and create
         try {
             await run(["pull", opts.image], 300_000);
         }
-        catch {
-            // Image might already exist locally, continue
-        }
+        catch { }
         const portForwards = opts.portForwards
-            ? opts.portForwards.split(",").map(s => s.trim()).filter(Boolean)
+            ? opts.portForwards
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
             : [];
-        // Pick setup network based on runtime and user preference:
-        // - Docker: "bridge" always works fine
-        // - Podman + internet enabled: omit --network flag ("podman-default") so
-        //   Podman uses its own default with proper DNS (respects containers.conf)
-        // - Podman + internet disabled: "none" — no network needed, skip packages
         let setupNetwork = "none";
         if (runtime?.kind === "docker") {
             setupNetwork = opts.network === "none" ? "none" : "bridge";
@@ -364,8 +472,6 @@ async function ensureReady(opts) {
             portForwards,
             hostMountPath: opts.hostMountPath || null,
         });
-        // Try with disk quota first; fall back without it if the storage driver
-        // doesn't support it (e.g. ext4 only supports size= on XFS).
         const diskOptArgs = [...createArgs];
         if (opts.diskLimitMB > 0) {
             diskOptArgs.splice(diskOptArgs.indexOf(opts.image), 0, "--storage-opt", `size=${opts.diskLimitMB}m`);
@@ -375,8 +481,9 @@ async function ensureReady(opts) {
         }
         catch (err) {
             const msg = err?.message ?? "";
-            if (msg.includes("storage-opt") || msg.includes("backingFS") || msg.includes("overlay.size")) {
-                // Storage driver doesn't support quotas — retry without the flag
+            if (msg.includes("storage-opt") ||
+                msg.includes("backingFS") ||
+                msg.includes("overlay.size")) {
                 console.warn("[lms-computer] Disk quota not supported by storage driver, starting without size limit.");
                 await run(createArgs, 60_000);
             }
@@ -384,16 +491,15 @@ async function ensureReady(opts) {
                 throw err;
             }
         }
-        // Setup: create user, install packages (skipped if no network)
         const hasNetworkForSetup = setupNetwork !== "none";
         await setupContainer(opts.image, opts.autoInstallPreset, hasNetworkForSetup);
-        // If the user wants no network access, disconnect now that setup is done.
-        // Only disconnect if we actually connected something during setup.
         if (opts.network === "none" && setupNetwork !== "none") {
             try {
                 await run(["network", "disconnect", setupNetwork, containerName], 10_000);
             }
-            catch { /* best effort — container still works, just has network */ }
+            catch {
+                /* best effort — container still works, just has network */
+            }
         }
         currentNetwork = setupNetwork !== "none" ? opts.network : "none";
         containerReady = true;
@@ -412,67 +518,10 @@ async function exec(command, timeoutSeconds, maxOutputBytes = constants_1.DEFAUL
     if (!runtime || !containerReady) {
         throw new Error("Container not ready. Call ensureReady() first.");
     }
-    const start = Date.now();
-    const cwd = workdir ?? constants_1.CONTAINER_WORKDIR;
-    const shell = containerName.includes("alpine") ? constants_1.CONTAINER_SHELL_ALPINE : constants_1.CONTAINER_SHELL;
-    return new Promise((resolve) => {
-        const args = [
-            "exec", "-w", cwd,
-            containerName,
-            shell, "-c", command,
-        ];
-        let stdout = "";
-        let stderr = "";
-        let timedOut = false;
-        let killed = false;
-        const proc = (0, child_process_1.spawn)(runtime.path, args, {
-            timeout: timeoutSeconds * 1000,
-            stdio: ["ignore", "pipe", "pipe"],
-            env: getRuntimeEnv(),
-        });
-        const effectiveMax = Math.min(maxOutputBytes, constants_1.MAX_OUTPUT_BYTES);
-        proc.stdout?.on("data", (chunk) => {
-            if (stdout.length < effectiveMax) {
-                stdout += chunk.toString("utf-8");
-            }
-        });
-        proc.stderr?.on("data", (chunk) => {
-            if (stderr.length < effectiveMax) {
-                stderr += chunk.toString("utf-8");
-            }
-        });
-        // Handle timeout
-        const timer = setTimeout(() => {
-            timedOut = true;
-            killed = true;
-            proc.kill("SIGKILL");
-        }, timeoutSeconds * 1000 + 500);
-        proc.on("close", (code) => {
-            clearTimeout(timer);
-            const durationMs = Date.now() - start;
-            const stdoutTruncated = stdout.length >= effectiveMax;
-            const stderrTruncated = stderr.length >= effectiveMax;
-            resolve({
-                exitCode: code ?? (killed ? 137 : 1),
-                stdout: stdout.slice(0, effectiveMax),
-                stderr: stderr.slice(0, effectiveMax),
-                timedOut,
-                durationMs,
-                truncated: stdoutTruncated || stderrTruncated,
-            });
-        });
-        proc.on("error", (err) => {
-            clearTimeout(timer);
-            resolve({
-                exitCode: 1,
-                stdout: "",
-                stderr: err.message,
-                timedOut: false,
-                durationMs: Date.now() - start,
-                truncated: false,
-            });
-        });
-    });
+    const cmdToRun = workdir && workdir !== constants_1.CONTAINER_WORKDIR
+        ? `cd ${workdir} && ${command}`
+        : command;
+    return execInSession(cmdToRun, timeoutSeconds, maxOutputBytes);
 }
 /**
  * Write a file inside the container using stdin piping.
@@ -481,21 +530,26 @@ async function writeFile(filePath, content) {
     if (!runtime || !containerReady) {
         throw new Error("Container not ready.");
     }
-    // Use docker exec with stdin to write file content
-    // This avoids shell escaping issues
     return new Promise((resolve, reject) => {
-        const shell = containerName.includes("alpine") ? constants_1.CONTAINER_SHELL_ALPINE : constants_1.CONTAINER_SHELL;
+        const shell = containerName.includes("alpine")
+            ? constants_1.CONTAINER_SHELL_ALPINE
+            : constants_1.CONTAINER_SHELL;
         const proc = (0, child_process_1.spawn)(runtime.path, [
-            "exec", "-i",
+            "exec",
+            "-i",
             containerName,
-            shell, "-c", `cat > '${filePath.replace(/'/g, "'\\''")}'`,
+            shell,
+            "-c",
+            `cat > '${filePath.replace(/'/g, "'\\''")}'`,
         ], {
             timeout: 15_000,
             stdio: ["pipe", "ignore", "pipe"],
             env: getRuntimeEnv(),
         });
         let stderr = "";
-        proc.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.stderr?.on("data", (chunk) => {
+            stderr += chunk.toString();
+        });
         proc.on("close", (code) => {
             if (code === 0)
                 resolve();
@@ -508,17 +562,137 @@ async function writeFile(filePath, content) {
     });
 }
 /**
- * Read a file from the container.
+ * Read a file from the container, optionally limited to a line range.
  */
-async function readFile(filePath, maxBytes) {
+async function readFile(filePath, maxBytes, startLine, endLine) {
     if (!runtime || !containerReady) {
         throw new Error("Container not ready.");
     }
-    const result = await exec(`cat '${filePath.replace(/'/g, "'\\''")}'`, 10, maxBytes);
+    const q = filePath.replace(/'/g, "'\\''");
+    const totalResult = await exec(`wc -l < '${q}' 2>/dev/null || echo 0`, 5);
+    const totalLines = parseInt(totalResult.stdout.trim(), 10) || 0;
+    let cmd;
+    if (startLine !== undefined && endLine !== undefined) {
+        cmd = `sed -n '${startLine},${endLine}p' '${q}'`;
+    }
+    else if (startLine !== undefined) {
+        cmd = `tail -n +${startLine} '${q}'`;
+    }
+    else {
+        cmd = `cat '${q}'`;
+    }
+    const result = await exec(cmd, 10, maxBytes);
     if (result.exitCode !== 0) {
         throw new Error(`Read failed: ${result.stderr || "file not found"}`);
     }
-    return result.stdout;
+    return { content: result.stdout, totalLines };
+}
+/**
+ * Replace an exact string in a file. Fails if the string is not found
+ * or appears more than once, matching the behaviour of surgical editors.
+ */
+async function strReplaceInFile(filePath, oldStr, newStr) {
+    if (!runtime || !containerReady) {
+        throw new Error("Container not ready.");
+    }
+    const q = filePath.replace(/'/g, "'\\''");
+    const readResult = await exec(`cat '${q}'`, 10, constants_1.MAX_OUTPUT_BYTES);
+    if (readResult.exitCode !== 0) {
+        throw new Error(`File not found: ${filePath}`);
+    }
+    const original = readResult.stdout;
+    const occurrences = original.split(oldStr).length - 1;
+    if (occurrences === 0) {
+        throw new Error(`String not found in ${filePath}.\n` +
+            `Hint: use ReadFile to view the current contents before editing.`);
+    }
+    if (occurrences > 1) {
+        throw new Error(`String appears ${occurrences} times in ${filePath} — it must be unique.\n` +
+            `Hint: include more surrounding context to make the match unique.`);
+    }
+    const updated = original.replace(oldStr, newStr);
+    await writeFile(filePath, updated);
+    return { replacements: 1 };
+}
+/**
+ * Insert lines into a file at a given line number.
+ * Line numbers are 1-based. Pass 0 to prepend, or a number past EOF to append.
+ */
+async function insertLinesInFile(filePath, afterLine, content) {
+    if (!runtime || !containerReady) {
+        throw new Error("Container not ready.");
+    }
+    const q = filePath.replace(/'/g, "'\\''");
+    const readResult = await exec(`cat '${q}'`, 10, constants_1.MAX_OUTPUT_BYTES);
+    if (readResult.exitCode !== 0) {
+        throw new Error(`File not found: ${filePath}`);
+    }
+    const lines = readResult.stdout.split("\n");
+    const insertLines = content.split("\n");
+    const clampedLine = Math.max(0, Math.min(afterLine, lines.length));
+    lines.splice(clampedLine, 0, ...insertLines);
+    await writeFile(filePath, lines.join("\n"));
+}
+const bgLogs = new Map();
+/**
+ * Run a command in the background inside the container.
+ * Returns a handle ID that can be used with readBgLogs.
+ */
+async function execBackground(command, timeoutSeconds) {
+    if (!runtime || !containerReady) {
+        throw new Error("Container not ready.");
+    }
+    const shell = containerName.includes("alpine")
+        ? constants_1.CONTAINER_SHELL_ALPINE
+        : constants_1.CONTAINER_SHELL;
+    const handleId = Date.now();
+    const entry = {
+        stdout: "",
+        stderr: "",
+        done: false,
+        exitCode: null,
+    };
+    bgLogs.set(handleId, entry);
+    const proc = (0, child_process_1.spawn)(runtime.path, ["exec", containerName, shell, "-c", command], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: getRuntimeEnv(),
+    });
+    const cap = constants_1.MAX_OUTPUT_BYTES * 2;
+    proc.stdout?.on("data", (chunk) => {
+        if (entry.stdout.length < cap)
+            entry.stdout += chunk.toString("utf-8");
+    });
+    proc.stderr?.on("data", (chunk) => {
+        if (entry.stderr.length < cap)
+            entry.stderr += chunk.toString("utf-8");
+    });
+    proc.on("close", (code) => {
+        entry.done = true;
+        entry.exitCode = code;
+    });
+    setTimeout(() => {
+        if (!entry.done) {
+            proc.kill("SIGKILL");
+            entry.done = true;
+            entry.exitCode = 137;
+        }
+    }, timeoutSeconds * 1_000);
+    return { handleId, pid: proc.pid ?? -1 };
+}
+/**
+ * Read buffered output from a background process by handle ID.
+ */
+function readBgLogs(handleId, maxBytes = constants_1.DEFAULT_MAX_OUTPUT_BYTES) {
+    const entry = bgLogs.get(handleId);
+    if (!entry)
+        return { stdout: "", stderr: "", done: true, exitCode: null, found: false };
+    return {
+        stdout: entry.stdout.slice(-maxBytes),
+        stderr: entry.stderr.slice(-maxBytes),
+        done: entry.done,
+        exitCode: entry.exitCode,
+        found: true,
+    };
 }
 /**
  * Copy a file from the host into the container.
@@ -570,11 +744,9 @@ echo "TOOLS=$(which git curl wget vim nano python3 node npm gcc make cmake pip3 
     const result = await exec(infoScript, 10);
     const lines = result.stdout.split("\n");
     const get = (prefix) => {
-        const line = lines.find(l => l.startsWith(prefix + "="));
+        const line = lines.find((l) => l.startsWith(prefix + "="));
         return line?.slice(prefix.length + 1)?.trim() ?? "N/A";
     };
-    // Compute disk values: if a limit is configured, report against it.
-    // Otherwise fall back to raw filesystem values.
     const diskUsedKB = parseInt(get("DISK_USED_KB") || "0", 10);
     const diskFreeRawKB = parseInt(get("DISK_FREE_RAW") || "0", 10);
     let diskTotal;
@@ -622,8 +794,8 @@ async function listProcesses() {
         return [];
     return result.stdout
         .split("\n")
-        .filter(line => line.trim() && !line.includes("ps aux"))
-        .map(line => {
+        .filter((line) => line.trim() && !line.includes("ps aux"))
+        .map((line) => {
         const parts = line.trim().split(/\s+/);
         return {
             pid: parseInt(parts[1] ?? "0", 10),
@@ -634,7 +806,7 @@ async function listProcesses() {
             command: parts.slice(10).join(" ") || parts.slice(3).join(" "),
         };
     })
-        .filter(p => p.pid > 0);
+        .filter((p) => p.pid > 0);
 }
 /**
  * Kill a process inside the container.
@@ -649,15 +821,23 @@ async function killProcess(pid, signal = "SIGTERM") {
 async function stopContainer(remove = false) {
     if (!runtime)
         return;
+    if (shellSession) {
+        shellSession.kill();
+        shellSession = null;
+    }
     try {
         await run(["stop", containerName], 15_000);
     }
-    catch { /* already stopped */ }
+    catch {
+        /* already stopped */
+    }
     if (remove) {
         try {
             await run(["rm", "-f", containerName], 10_000);
         }
-        catch { /* already removed */ }
+        catch {
+            /* already removed */
+        }
     }
     containerReady = false;
 }
@@ -669,6 +849,25 @@ async function destroyContainer() {
     containerReady = false;
     currentNetwork = "none";
     initPromise = null;
+}
+/**
+ * Restart the container without wiping its data.
+ * Stops the running container, kills the shell session, then starts it again.
+ * Faster than a full rebuild — filesystem and installed packages are preserved.
+ */
+async function restartContainer() {
+    if (!runtime)
+        throw new Error("Runtime not initialized.");
+    if (shellSession) {
+        shellSession.kill();
+        shellSession = null;
+    }
+    try {
+        await run(["stop", containerName], 15_000);
+    }
+    catch { }
+    await run(["start", containerName], 30_000);
+    containerReady = true;
 }
 /**
  * Get detailed container info.
@@ -693,23 +892,27 @@ async function getContainerInfo() {
         };
     }
     try {
-        const format = '{{.Id}}\t{{.Config.Image}}\t{{.Created}}\t{{.State.Status}}\t{{.HostConfig.NetworkMode}}';
+        const format = "{{.Id}}\t{{.Config.Image}}\t{{.Created}}\t{{.State.Status}}\t{{.HostConfig.NetworkMode}}";
         const out = await run(["inspect", containerName, "--format", format]);
         const [id, image, created, , networkMode] = out.split("\t");
-        // Get stats if running
         let cpuUsage = null;
         let memoryUsage = null;
         if (state === "running") {
             try {
                 const stats = await run([
-                    "stats", containerName, "--no-stream",
-                    "--format", "{{.CPUPerc}}\t{{.MemUsage}}",
+                    "stats",
+                    containerName,
+                    "--no-stream",
+                    "--format",
+                    "{{.CPUPerc}}\t{{.MemUsage}}",
                 ], 10_000);
                 const [cpu, mem] = stats.split("\t");
                 cpuUsage = cpu?.trim() ?? null;
                 memoryUsage = mem?.trim() ?? null;
             }
-            catch { /* stats not available */ }
+            catch {
+                /* stats not available */
+            }
         }
         return {
             id: id?.slice(0, 12) ?? "",
@@ -745,31 +948,29 @@ async function getContainerInfo() {
  * Update the container's network mode (requires restart).
  */
 async function updateNetwork(mode, opts) {
-    // Docker doesn't allow changing network on a running container,
-    // so we need to recreate it.
     const hadContainer = (await getContainerState()) !== "not_found";
     if (hadContainer) {
-        // Commit current state to a temporary image if persistent
         const tempImage = `${containerName}-state:latest`;
         if (opts.persistenceMode === "persistent") {
             try {
                 await run(["commit", containerName, tempImage], 60_000);
             }
-            catch { /* best effort */ }
+            catch {
+                /* best effort */
+            }
         }
         await destroyContainer();
-        // Recreate with new network settings, using committed image if available
         const useImage = opts.persistenceMode === "persistent" ? tempImage : opts.image;
         const actualOpts = { ...opts, network: mode };
-        // Override image for recreation
         containerReady = false;
         await ensureReady({ ...actualOpts, image: useImage });
-        // Clean up temp image
         if (opts.persistenceMode === "persistent") {
             try {
                 await run(["rmi", tempImage], 10_000);
             }
-            catch { /* best effort */ }
+            catch {
+                /* best effort */
+            }
         }
     }
 }
@@ -778,6 +979,17 @@ async function updateNetwork(mode, opts) {
  */
 function isReady() {
     return containerReady;
+}
+/**
+ * Reset the persistent shell session without touching the container.
+ * Useful when the model wants a clean shell (fresh env vars, back to home dir)
+ * without a full container rebuild.
+ */
+function resetShellSession() {
+    if (shellSession) {
+        shellSession.kill();
+        shellSession = null;
+    }
 }
 /**
  * Verify the container is actually running. If it has been deleted or stopped
@@ -792,11 +1004,19 @@ async function verifyHealth() {
         if (state !== "running") {
             containerReady = false;
             currentNetwork = "none";
+            if (shellSession) {
+                shellSession.kill();
+                shellSession = null;
+            }
         }
     }
     catch {
         containerReady = false;
         currentNetwork = "none";
+        if (shellSession) {
+            shellSession.kill();
+            shellSession = null;
+        }
     }
 }
 /**

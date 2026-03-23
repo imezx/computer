@@ -35,9 +35,42 @@ export declare function exec(command: string, timeoutSeconds: number, maxOutputB
  */
 export declare function writeFile(filePath: string, content: string): Promise<void>;
 /**
- * Read a file from the container.
+ * Read a file from the container, optionally limited to a line range.
  */
-export declare function readFile(filePath: string, maxBytes: number): Promise<string>;
+export declare function readFile(filePath: string, maxBytes: number, startLine?: number, endLine?: number): Promise<{
+    content: string;
+    totalLines: number;
+}>;
+/**
+ * Replace an exact string in a file. Fails if the string is not found
+ * or appears more than once, matching the behaviour of surgical editors.
+ */
+export declare function strReplaceInFile(filePath: string, oldStr: string, newStr: string): Promise<{
+    replacements: number;
+}>;
+/**
+ * Insert lines into a file at a given line number.
+ * Line numbers are 1-based. Pass 0 to prepend, or a number past EOF to append.
+ */
+export declare function insertLinesInFile(filePath: string, afterLine: number, content: string): Promise<void>;
+/**
+ * Run a command in the background inside the container.
+ * Returns a handle ID that can be used with readBgLogs.
+ */
+export declare function execBackground(command: string, timeoutSeconds: number): Promise<{
+    handleId: number;
+    pid: number;
+}>;
+/**
+ * Read buffered output from a background process by handle ID.
+ */
+export declare function readBgLogs(handleId: number, maxBytes?: number): {
+    stdout: string;
+    stderr: string;
+    done: boolean;
+    exitCode: number | null;
+    found: boolean;
+};
 /**
  * Copy a file from the host into the container.
  */
@@ -67,6 +100,12 @@ export declare function stopContainer(remove?: boolean): Promise<void>;
  */
 export declare function destroyContainer(): Promise<void>;
 /**
+ * Restart the container without wiping its data.
+ * Stops the running container, kills the shell session, then starts it again.
+ * Faster than a full rebuild — filesystem and installed packages are preserved.
+ */
+export declare function restartContainer(): Promise<void>;
+/**
  * Get detailed container info.
  */
 export declare function getContainerInfo(): Promise<ContainerInfo>;
@@ -78,6 +117,12 @@ export declare function updateNetwork(mode: NetworkMode, opts: Parameters<typeof
  * Check if the container engine is ready.
  */
 export declare function isReady(): boolean;
+/**
+ * Reset the persistent shell session without touching the container.
+ * Useful when the model wants a clean shell (fresh env vars, back to home dir)
+ * without a full container rebuild.
+ */
+export declare function resetShellSession(): void;
 /**
  * Verify the container is actually running. If it has been deleted or stopped
  * externally, resets containerReady so ensureReady() will recreate it.

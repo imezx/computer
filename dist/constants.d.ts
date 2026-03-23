@@ -66,11 +66,11 @@ export declare const PACKAGE_PRESETS_ALPINE: Record<string, string[]>;
 export declare const MAX_INJECTED_CONTEXT_CHARS = 2000;
 /** Valid base images the user can select. */
 export declare const VALID_IMAGES: readonly ["ubuntu:24.04", "ubuntu:22.04", "alpine:3.20", "debian:bookworm-slim"];
-export type ContainerImage = typeof VALID_IMAGES[number];
+export type ContainerImage = (typeof VALID_IMAGES)[number];
 export declare const NETWORK_MODES: readonly ["none", "bridge", "slirp4netns", "pasta", "podman-default"];
-export type NetworkMode = typeof NETWORK_MODES[number];
+export type NetworkMode = (typeof NETWORK_MODES)[number];
 export declare const PERSISTENCE_MODES: readonly ["persistent", "ephemeral"];
-export type PersistenceMode = typeof PERSISTENCE_MODES[number];
+export type PersistenceMode = (typeof PERSISTENCE_MODES)[number];
 export declare const CONTAINER_STATES: readonly ["running", "stopped", "not_found", "error"];
-export type ContainerState = typeof CONTAINER_STATES[number];
+export type ContainerState = (typeof CONTAINER_STATES)[number];
 //# sourceMappingURL=constants.d.ts.map

@@ -31,7 +31,6 @@ function checkCommand(command, strictMode) {
         return { allowed: true };
     }
     const normalized = normalize(command);
-    // Check each blocked pattern
     for (const pattern of constants_1.BLOCKED_COMMANDS_STRICT) {
         const normalizedPattern = normalize(pattern);
         if (normalized.includes(normalizedPattern)) {
@@ -42,15 +41,14 @@ function checkCommand(command, strictMode) {
             };
         }
     }
-    // Check for obvious fork bomb patterns (various forms)
     if (/:\(\)\s*\{.*\}/.test(normalized) || /\.\(\)\s*\{.*\}/.test(normalized)) {
         return {
             allowed: false,
             reason: "Blocked by strict safety mode: detected fork bomb pattern.",
         };
     }
-    // Block writing directly to block devices
-    if (/>\s*\/dev\/[sh]d[a-z]/.test(normalized) || /of=\/dev\/[sh]d[a-z]/.test(normalized)) {
+    if (/>\s*\/dev\/[sh]d[a-z]/.test(normalized) ||
+        /of=\/dev\/[sh]d[a-z]/.test(normalized)) {
         return {
             allowed: false,
             reason: "Blocked by strict safety mode: direct write to block device.",

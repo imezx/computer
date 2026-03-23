@@ -66,7 +66,6 @@ function readConfig(ctl) {
  * Build a concise context block about the computer's current state.
  */
 async function buildContextBlock(cfg) {
-    // If container isn't running yet, just describe what's available
     if (!engine.isReady()) {
         return [
             `[Computer — Available]`,
@@ -77,7 +76,6 @@ async function buildContextBlock(cfg) {
             `Working directory: ${constants_1.CONTAINER_WORKDIR}`,
         ].join("\n");
     }
-    // Container is running — get live info
     try {
         const quickInfo = await engine.exec(`echo "OS=$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')" && ` +
             `echo "TOOLS=$(which git curl wget python3 node gcc pip3 2>/dev/null | xargs -I{} basename {} | tr '\\n' ',')" && ` +
@@ -88,7 +86,7 @@ async function buildContextBlock(cfg) {
         }
         const lines = quickInfo.stdout.split("\n");
         const get = (prefix) => {
-            const line = lines.find(l => l.startsWith(prefix + "="));
+            const line = lines.find((l) => l.startsWith(prefix + "="));
             return line?.slice(prefix.length + 1)?.trim() ?? "";
         };
         const os = get("OS");
@@ -120,13 +118,9 @@ async function buildContextBlock(cfg) {
 }
 async function promptPreprocessor(ctl, userMessage) {
     const cfg = readConfig(ctl);
-    // ALWAYS reset the tool call budget on every new user message.
-    // This is the core mechanism that limits per-turn tool usage.
     (0, toolsProvider_1.advanceTurn)(cfg.maxToolCalls);
-    // Skip context injection if disabled
     if (!cfg.autoInject)
         return userMessage;
-    // Skip for very short messages (greetings, etc.)
     if (userMessage.length < 5)
         return userMessage;
     try {
@@ -136,7 +130,6 @@ async function promptPreprocessor(ctl, userMessage) {
         return `${context}\n\n---\n\n${userMessage}`;
     }
     catch {
-        // Never block the conversation if context injection fails
         return userMessage;
     }
 }

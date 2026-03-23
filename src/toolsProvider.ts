@@ -129,16 +129,17 @@ export async function toolsProvider(ctl: PluginController) {
     name: "Execute",
     description:
       `Run a shell command on your dedicated Linux computer.\n\n` +
-      `This is a real, isolated Linux container — you can install packages, ` +
+      `IMPORTANT: This runs in a persistent shell session — state is preserved between calls.\n` +
+      `• cd, export, source, nvm use, conda activate — all persist across commands\n` +
+      `• You are always in the same shell; no need to repeat setup\n` +
+      `• Use pwd to check where you are, env to see variables\n\n` +
+      `This is a real isolated Linux container. You can install packages, ` +
       `compile code, run scripts, manage files, start services, etc.\n\n` +
-      `The working directory is ${CONTAINER_WORKDIR}. ` +
-      `You have full shell access (bash on Ubuntu/Debian, sh on Alpine).\n\n` +
       `TIPS:\n` +
-      `• Chain commands with && or ;\n` +
-      `• Use 2>&1 to merge stderr into stdout\n` +
-      `• For long-running tasks, consider backgrounding with & and checking later\n` +
-      `• Install packages with apt-get (Ubuntu/Debian) or apk (Alpine)\n` +
-      `• The computer persists between messages (unless ephemeral mode is on)`,
+      `• Chain with && or ; as usual\n` +
+      `• Use 2>&1 to capture stderr\n` +
+      `• Background long tasks with & (e.g. starting a server)\n` +
+      `• Install packages with apt-get (Ubuntu/Debian) or apk (Alpine)`,
     parameters: {
       command: z
         .string()
@@ -217,10 +218,11 @@ export async function toolsProvider(ctl: PluginController) {
   const writeFileTool = tool({
     name: "WriteFile",
     description:
-      `Create or overwrite a file inside the computer.\n\n` +
-      `Use this to write code, configs, scripts, data files, etc. ` +
-      `Parent directories are created automatically.\n` +
-      `Working directory: ${CONTAINER_WORKDIR}`,
+      `Create or overwrite a complete file inside the computer.\n\n` +
+      `Use for new files or when replacing the entire content. ` +
+      `For editing existing files, prefer StrReplace or InsertLines — ` +
+      `they are faster and use far less context. ` +
+      `Parent directories are created automatically.`,
     parameters: {
       path: z
         .string()
@@ -283,35 +285,33 @@ export async function toolsProvider(ctl: PluginController) {
   const readFileTool = tool({
     name: "ReadFile",
     description:
-      `Read the contents of a file from the computer.\n\n` +
-      `Returns the file content as text. Binary files may not display correctly — ` +
-      `use Execute with tools like xxd or file for binary inspection.`,
+      `Read a file from the computer, optionally limited to a line range.\n\n` +
+      `Always read a file before editing it with StrReplace. ` +
+      `For large files use startLine/endLine to read only the section you need — ` +
+      `this keeps context short. Binary files may not display correctly.`,
     parameters: {
       path: z
         .string()
         .min(1)
         .max(500)
         .describe("File path inside the container."),
-      maxLines: z
-        .number()
-        .int()
-        .min(1)
-        .max(2000)
-        .optional()
-        .describe(
-          "Max lines to return (default: all, up to size limit). Use for large files.",
-        ),
       startLine: z
         .number()
         .int()
         .min(1)
         .optional()
+        .describe("First line to return (1-based, inclusive)."),
+      endLine: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
         .describe(
-          "Start reading from this line number (1-based). Combine with maxLines to read a range.",
+          "Last line to return (1-based, inclusive). Requires startLine.",
         ),
     },
     implementation: async (
-      { path: filePath, maxLines, startLine },
+      { path: filePath, startLine, endLine },
       { status, warn },
     ) => {
       const budgetError = consumeBudget();
@@ -319,48 +319,135 @@ export async function toolsProvider(ctl: PluginController) {
 
       try {
         await ensureContainer(cfg, status);
-
         status(`Reading: ${filePath}`);
 
-        let cmd: string;
-        if (startLine && maxLines) {
-          cmd = `sed -n '${startLine},${startLine + maxLines - 1}p' '${filePath.replace(/'/g, "'\\''")}'`;
-        } else if (maxLines) {
-          cmd = `head -n ${maxLines} '${filePath.replace(/'/g, "'\\''")}'`;
-        } else {
-          cmd = `cat '${filePath.replace(/'/g, "'\\''")}'`;
-        }
-
-        const result = await engine.exec(cmd, 10, MAX_FILE_READ_BYTES);
-
-        if (result.exitCode !== 0) {
-          return {
-            error: result.stderr || "File not found or unreadable",
-            path: filePath,
-            budget: budgetStatus(),
-          };
-        }
-
-        const sizeResult = await engine.exec(
-          `stat -c '%s' '${filePath.replace(/'/g, "'\\''")}'  2>/dev/null || stat -f '%z' '${filePath.replace(/'/g, "'\\''")}' 2>/dev/null`,
-          3,
+        const { content, totalLines } = await engine.readFile(
+          filePath,
+          MAX_FILE_READ_BYTES,
+          startLine,
+          endLine,
         );
-        const sizeBytes = parseInt(sizeResult.stdout.trim(), 10) || 0;
 
         return {
           path: filePath,
-          content: result.stdout,
-          sizeBytes,
-          truncated: result.truncated,
+          content,
+          totalLines,
           lineRange: startLine
-            ? { from: startLine, count: maxLines ?? "all" }
+            ? { from: startLine, to: endLine ?? totalLines }
             : undefined,
           budget: budgetStatus(),
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         warn(`Read failed: ${msg}`);
-        return { error: msg, budget: budgetStatus() };
+        return {
+          error: msg,
+          path: filePath,
+          hint: "Check the path is correct with ListDirectory.",
+          budget: budgetStatus(),
+        };
+      }
+    },
+  });
+
+  const strReplaceTool = tool({
+    name: "StrReplace",
+    description:
+      `Replace an exact unique string in a file with new content.\n\n` +
+      `This is the preferred way to edit existing files — use it instead of ` +
+      `rewriting the whole file with WriteFile.\n\n` +
+      `Rules:\n` +
+      `• oldStr must match the file exactly (whitespace, indentation included)\n` +
+      `• oldStr must appear exactly once — make it unique by including surrounding lines\n` +
+      `• Always ReadFile first to see the current content\n` +
+      `• To delete a section, set newStr to an empty string`,
+    parameters: {
+      path: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe("File path inside the container."),
+      oldStr: z
+        .string()
+        .min(1)
+        .describe(
+          "The exact string to find and replace. Must be unique in the file.",
+        ),
+      newStr: z
+        .string()
+        .describe("The replacement string. Use empty string to delete."),
+    },
+    implementation: async (
+      { path: filePath, oldStr, newStr },
+      { status, warn },
+    ) => {
+      const budgetError = consumeBudget();
+      if (budgetError) return { error: budgetError, budget: budgetStatus() };
+
+      try {
+        await ensureContainer(cfg, status);
+        status(`Editing: ${filePath}`);
+        const { replacements } = await engine.strReplaceInFile(
+          filePath,
+          oldStr,
+          newStr,
+        );
+        return {
+          edited: true,
+          path: filePath,
+          replacements,
+          budget: budgetStatus(),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warn(`StrReplace failed: ${msg}`);
+        return { error: msg, edited: false, budget: budgetStatus() };
+      }
+    },
+  });
+
+  const insertLinesTool = tool({
+    name: "InsertLines",
+    description:
+      `Insert lines into a file at a specific position.\n\n` +
+      `Use this to add new content without replacing existing content. ` +
+      `afterLine=0 prepends to the file. afterLine equal to the total line count appends.`,
+    parameters: {
+      path: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe("File path inside the container."),
+      afterLine: z
+        .number()
+        .int()
+        .min(0)
+        .describe(
+          "Insert after this line number (1-based). Use 0 to insert at the top.",
+        ),
+      content: z.string().describe("The lines to insert."),
+    },
+    implementation: async (
+      { path: filePath, afterLine, content },
+      { status, warn },
+    ) => {
+      const budgetError = consumeBudget();
+      if (budgetError) return { error: budgetError, budget: budgetStatus() };
+
+      try {
+        await ensureContainer(cfg, status);
+        status(`Inserting into: ${filePath}`);
+        await engine.insertLinesInFile(filePath, afterLine, content);
+        return {
+          inserted: true,
+          path: filePath,
+          afterLine,
+          budget: budgetStatus(),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warn(`InsertLines failed: ${msg}`);
+        return { error: msg, inserted: false, budget: budgetStatus() };
       }
     },
   });
@@ -668,14 +755,157 @@ export async function toolsProvider(ctl: PluginController) {
     },
   });
 
+  const resetShellTool = tool({
+    name: "ResetShell",
+    description:
+      `Reset the persistent shell session back to a clean state.\n\n` +
+      `Use this when:\n` +
+      `• The shell is in a broken state (stuck command, corrupted env)\n` +
+      `• You want to start fresh without rebuilding the whole container\n` +
+      `• Environment variables or working directory are in an unexpected state\n\n` +
+      `This does NOT wipe the container filesystem — files, installed packages, ` +
+      `and running background processes are all preserved. ` +
+      `It only resets the shell session (cwd back to home, env vars cleared).`,
+    parameters: {},
+    implementation: async (_, { status }) => {
+      engine.resetShellSession();
+      status("Shell session reset.");
+      return {
+        reset: true,
+        message:
+          "Shell session reset. Working directory is back to /home/user with a clean environment.",
+        budget: budgetStatus(),
+      };
+    },
+  });
+
+  const executeBackgroundTool = tool({
+    name: "ExecuteBackground",
+    description:
+      `Run a command in the background and get a handle to check its output later.\n\n` +
+      `Use this for long-running tasks that shouldn't block: servers, watchers, ` +
+      `build processes, test suites, etc.\n\n` +
+      `Returns a handleId. Use ReadProcessLogs with that handleId to stream output. ` +
+      `Background processes survive across multiple turns.`,
+    parameters: {
+      command: z
+        .string()
+        .min(1)
+        .describe("Shell command to run in the background."),
+      timeout: z
+        .number()
+        .int()
+        .min(5)
+        .max(3600)
+        .optional()
+        .describe("Max seconds before the process is killed. Default: 300."),
+    },
+    implementation: async ({ command, timeout }, { status, warn }) => {
+      const budgetError = consumeBudget();
+      if (budgetError) return { error: budgetError, budget: budgetStatus() };
+
+      try {
+        await ensureContainer(cfg, status);
+        status(
+          `Starting background: ${command.slice(0, 60)}${command.length > 60 ? "…" : ""}`,
+        );
+        const { handleId, pid } = await engine.execBackground(
+          command,
+          timeout ?? 300,
+        );
+        return {
+          started: true,
+          handleId,
+          pid,
+          message: `Process started. Use ReadProcessLogs with handleId ${handleId} to check output.`,
+          budget: budgetStatus(),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warn(`Background exec failed: ${msg}`);
+        return { error: msg, started: false, budget: budgetStatus() };
+      }
+    },
+  });
+
+  const readProcessLogsTool = tool({
+    name: "ReadProcessLogs",
+    description:
+      `Read buffered output from a background process started with ExecuteBackground.\n\n` +
+      `Call this repeatedly to check on a running process. ` +
+      `Returns stdout, stderr, whether the process is still running, and its exit code if done.`,
+    parameters: {
+      handleId: z
+        .number()
+        .int()
+        .describe("The handleId returned by ExecuteBackground."),
+    },
+    implementation: async ({ handleId }, { warn }) => {
+      const budgetError = consumeBudget();
+      if (budgetError) return { error: budgetError, budget: budgetStatus() };
+
+      const logs = engine.readBgLogs(handleId, MAX_FILE_READ_BYTES);
+      if (!logs.found) {
+        return {
+          error: `No process found with handleId ${handleId}.`,
+          hint: "handleIds are only valid within the current LM Studio session.",
+          budget: budgetStatus(),
+        };
+      }
+
+      return {
+        handleId,
+        stdout: logs.stdout || "(no output yet)",
+        stderr: logs.stderr || "",
+        running: !logs.done,
+        exitCode: logs.exitCode,
+        budget: budgetStatus(),
+      };
+    },
+  });
+
+  const restartComputerTool = tool({
+    name: "RestartComputer",
+    description:
+      `Stop and restart the container without wiping any data.\n\n` +
+      `Use this when:\n` +
+      `- A runaway process is consuming too many resources\n` +
+      `- The container feels sluggish or unresponsive\n` +
+      `- You want a clean shell session but keep installed packages and files\n\n` +
+      `Faster than RebuildComputer. All files and installed packages are preserved. ` +
+      `Background processes will be stopped.`,
+    parameters: {},
+    implementation: async (_, { status, warn }) => {
+      try {
+        status("Restarting computer…");
+        await engine.restartContainer();
+        return {
+          restarted: true,
+          message: "Container restarted. Files and packages are intact.",
+          budget: budgetStatus(),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warn(`Restart failed: ${msg}`);
+        return { error: msg, restarted: false, budget: budgetStatus() };
+      }
+    },
+  });
+
   return [
     executeTool,
     writeFileTool,
     readFileTool,
+    strReplaceTool,
+    insertLinesTool,
     listDirTool,
     uploadFileTool,
     downloadFileTool,
     statusTool,
+    restartComputerTool,
     rebuildTool,
+    resetShellTool,
+    executeBackgroundTool,
+    readProcessLogsTool,
   ];
 }

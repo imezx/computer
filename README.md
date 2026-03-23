@@ -1,6 +1,6 @@
 # lms-plugin-computer
 
-Give your local model its own Linux CLI computer. It gets a real isolated container it can run shell commands in, write and read files, install packages, and manage processes - all without touching your host system.
+Give your local model its own Linux CLI computer. It gets a real isolated container it can run shell commands in, write and read files, install packages, manage processes, and run background tasks - all without touching your host system.
 
 ---
 
@@ -18,7 +18,7 @@ sudo apt install uidmap slirp4netns
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 ```
 
-Then log out and back in. The plugin takes care of everything else automatically.
+Then log out and back in. The plugin handles everything else automatically.
 
 ---
 
@@ -29,14 +29,11 @@ The easiest way:
 lms install khtsly/computer
 ```
 
-Or from source if you want to build it yourself:
+Or from source:
 ```bash
 git clone https://github.com/khtsly/lms-plugin-computer
 cd lms-plugin-computer
-# with bun
-bun run dev
-# with node
-npm run dev
+bun run dev   # or: npm run dev
 ```
 
 ---
@@ -47,7 +44,7 @@ npm run dev
 2. Enable the **khtsly/computer** plugin from the plugin panel
 3. Say something like *"do you have a computer?"* or just give it a task
 
-On first use it will pull the Ubuntu image and set up the container - this takes a bit while for the first time.
+On first use it pulls the Ubuntu image and sets up the container - this takes a minute. After that it's instant.
 
 ---
 
@@ -57,7 +54,7 @@ Click the gear icon next to the plugin to open settings.
 
 ### The basics
 
-**Internet Access** - `off` by **default**. Turn this *on* if you want the model to install packages with `apt-get`, `pip`, `npm`, etc. If you change this after the container is already running, just tell the model *"rebuild the computer"* and it will recreate it with the new setting.
+**Internet Access** - off by default. Turn this on if you want the model to install packages with `apt-get`, `pip`, `npm`, etc. If you change this after the container is already running, just tell the model *"rebuild the computer"* and it will recreate with the new setting.
 
 **Persistence Mode** - persistent by default, meaning files and installed packages survive across sessions. Switch to ephemeral if you want a clean slate every time LM Studio opens.
 
@@ -73,7 +70,7 @@ Click the gear icon next to the plugin to open settings.
 
 ### Other options
 
-**Auto-Install Packages** - choose what gets pre-installed when the container is first created. Options range from nothing to a full set including Python, Node.js, build tools, and networking utilities.
+**Auto-Install Packages** - choose what gets pre-installed when the container is first created. Options range from nothing to a full set including Python, Node.js, build tools, and networking utilities. Requires Internet Access to be on.
 
 **Shared Folder** - mount a folder from your computer into the container at `/mnt/shared`. Useful for giving the model access to your files without going through the upload tool every time.
 
@@ -85,14 +82,33 @@ Click the gear icon next to the plugin to open settings.
 
 ## What the model can do?
 
-The model has access to these tools automatically - you don't need to ask it to use them, it figures out what's needed on its own.
+The model has access to these tools automatically - no need to ask it to use them, it figures out what's needed on its own.
 
-- **Execute** - run shell commands
-- **WriteFile / ReadFile** - create and read files inside the container
-- **ListDirectory** - browse the filesystem
-- **UploadFile / DownloadFile** - move files between the container and your computer
-- **ComputerStatus** - check system info, resource usage, running processes
-- **RebuildComputer** - tear down and recreate the container from scratch
+### Shell
+| Tool | Description |
+|------|-------------|
+| **Execute** | Run shell commands in a persistent session - `cd`, `export`, `source`, and environment variables all carry over between calls |
+| **ExecuteBackground** | Start a long-running process in the background (servers, watchers, builds) and get a handle to check on it later |
+| **ReadProcessLogs** | Read buffered stdout/stderr from a background process |
+
+### Files
+| Tool | Description |
+|------|-------------|
+| **WriteFile** | Create or overwrite a file |
+| **ReadFile** | Read a file, optionally a specific line range |
+| **StrReplace** | Replace an exact unique string in a file - the preferred way to edit code without rewriting the whole file |
+| **InsertLines** | Insert lines at a specific position in a file |
+| **ListDirectory** | Browse the filesystem |
+| **UploadFile** | Copy a file from your computer into the container |
+| **DownloadFile** | Copy a file from the container to your computer |
+
+### Container management
+| Tool | Preserves data | Speed | Use when |
+|------|---------------|-------|----------|
+| **ComputerStatus** | - | Instant | Check system info, resource usage, running processes |
+| **ResetShell** | V | Instant | Shell env is broken, want clean vars without touching files |
+| **RestartComputer** | V | Fast | Container is sluggish, runaway process, want a fresh start |
+| **RebuildComputer** | x | Slow | Network setting changed, environment is fully broken |
 
 ---
 
@@ -101,30 +117,37 @@ The model has access to these tools automatically - you don't need to ask it to 
 **Run some code**
 > "Write a Python script that generates a Fibonacci sequence up to 1000 and save it as fib.py"
 
+**Edit a file surgically**
+> "Fix the bug in line 42 of server.py"
+
+The model will read just that section of the file and replace the broken line instead of rewriting everything.
+
 **Set up an environment**
 > "Set up a Node.js project with Express, create a basic REST API, and start the server"
 
-**Work with your files**
-> Attach a CSV file and say: "Analyse this data and give me a summary with the key trends"
-
 **Run a web server you can actually open**
-> Set Port Forwards to `8080:8080` in settings, then say: "Build a simple dashboard and serve it on port 8080"
+Set Port Forwards to `8080:8080` in settings, then:
+> "Build a simple dashboard and serve it on port 8080"
+
+**Work with your files**
+Attach a CSV and say:
+> "Analyse this data and give me a summary with the key trends"
 
 ---
 
 ## Troubleshooting
 
 **"No container found" error on startup**
-Your runtime isn't running. On Windows and Mac, make sure Docker Desktop is open. On Linux, check that `docker` or `podman` is installed and accessible.
+Your runtime isn't running. On Windows and Mac, make sure Docker Desktop is open. On Linux, check that `docker` or `podman` is installed.
 
 **Internet doesn't work inside the container**
-First check that Internet Access is set to On in settings. If it was already running before you toggled it, the container needs to be recreated - just tell the model:
+Check that Internet Access is set to On in settings. If the container was already created before you toggled it, tell the model:
 > "Rebuild the computer"
 
-It will destroy the old container and create a new one with internet enabled.
+It will recreate the container with internet enabled.
 
 **Container keeps failing on Linux**
-Make sure you ran the setup commands in the requirements section. Then clear the old container and let it recreate:
+Make sure you ran the setup commands from the requirements section. Then clear the old container and let it recreate:
 ```bash
 podman rm -f lms-computer-main
 ```
@@ -133,17 +156,19 @@ podman rm -f lms-computer-main
 Increase Command Timeout in settings. The default 30 seconds isn't always enough for large package installs or slow builds.
 
 **Files disappeared after reopening LM Studio**
-Check that Persistence Mode is set to Persistent. If it was set to Ephemeral, the container was wiped on close - that's expected behaviour.
+Check that Persistence Mode is set to Persistent. Ephemeral mode wipes the container on close - that's expected.
 
 ---
 
 ## A few things worth knowing
 
-The container is fully isolated - it can't access anything on your host unless you set up a shared folder or port forward. Your files are safe.
+The shell session is persistent within a conversation - `cd`, `export`, `nvm use`, `conda activate` all carry over between commands, just like a real terminal.
 
-The disk limit is only hard-enforced on XFS filesystems. On ext4 (most Linux installs), usage is tracked and reported correctly but the limit isn't enforced at the OS level.
+The container is fully isolated and can't access anything on your host unless you configure a shared folder or port forward.
 
-Changing the base image only takes effect on a fresh container. If you switch from Ubuntu to Alpine, tell the model to rebuild.
+The disk limit is only hard-enforced on XFS filesystems. On ext4 (most Linux installs) usage is tracked and reported correctly but not enforced at the OS level.
+
+Changing the base image only takes effect on a fresh container - tell the model to rebuild after switching.
 
 ---
 
