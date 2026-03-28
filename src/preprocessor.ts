@@ -1,16 +1,11 @@
 /**
  * @file preprocessor.ts
- * Prompt preprocessor — serves two purposes:
+ * Prompt preprocessor — two jobs:
  *
- *   1. Resets the per-turn tool call budget every time the user sends a new message.
- *   2. Optionally injects computer state (OS, tools, network) into the model's
- *      context so it knows what it's working with without needing to ask.
- *
- * Flow:
- *   1. User types a message
- *   2. Preprocessor fires → resets tool call budget → gathers computer state
- *   3. Prepends computer context to the user's message
- *   4. Model sees the context and can start using tools immediately
+ *   1. Resets the per-turn tool call budget every time the user sends a message.
+ *   2. Optionally injects computer state (OS, tools, network, active background
+ *      processes) into the model's context so it knows what it's working with
+ *      without spending a tool call to find out.
  */
 
 import { configSchematics } from "./config";
@@ -42,17 +37,17 @@ async function buildContextBlock(
       `You have a dedicated Linux computer (${cfg.baseImage}) available via tools.`,
       `Internet: ${cfg.internetAccess ? "enabled" : "disabled"}.`,
       `Mode: ${cfg.persistenceMode}.`,
-      `The computer will start automatically when you first use a tool (Execute, WriteFile, etc.).`,
+      `The computer will start automatically when you first use a tool.`,
       `Working directory: ${CONTAINER_WORKDIR}`,
     ].join("\n");
   }
 
   try {
     const quickInfo = await engine.exec(
-      `echo "OS=$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')" && ` +
-        `echo "TOOLS=$(which git curl wget python3 node gcc pip3 2>/dev/null | xargs -I{} basename {} | tr '\\n' ',')" && ` +
-        `echo "FILES=$(ls ${CONTAINER_WORKDIR} 2>/dev/null | head -10 | tr '\\n' ',')" && ` +
-        `echo "DISK=$(df -h ${CONTAINER_WORKDIR} 2>/dev/null | tail -1 | awk '{print $4 \" free / \" $2 \" total\"}')"`,
+      `echo "OS=$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')" && ` +
+      `echo "TOOLS=$(which git curl wget python3 node gcc pip3 2>/dev/null | xargs -I{} basename {} | tr '\\n' ',')" && ` +
+      `echo "FILES=$(ls ${CONTAINER_WORKDIR} 2>/dev/null | head -10 | tr '\\n' ',')" && ` +
+      `echo "DISK=$(df -h ${CONTAINER_WORKDIR} 2>/dev/null | tail -1 | awk '{print $4 \" free / \" $2 \" total\"}')"`,
       5,
       MAX_INJECTED_CONTEXT_CHARS,
     );
@@ -92,9 +87,26 @@ async function buildContextBlock(
       parts.push(`Workspace (${CONTAINER_WORKDIR}): empty`);
     }
 
+    try {
+      const bgProcs = engine.listBgProcesses().filter((p) => p.running);
+      if (bgProcs.length > 0) {
+        const bgSummary = bgProcs
+          .map((p) => `  [handleId:${p.handleId}] ${p.command} — running for ${p.runtimeSecs}s`)
+          .join("\n");
+        parts.push(
+          ``,
+          `Active background processes (${bgProcs.length}):`,
+          bgSummary,
+          `Use ReadProcessLogs(handleId) to check output, KillBackground(handleId) to stop.`,
+        );
+      }
+    } catch {
+      /* bg process list is best-effort — never block the preprocessor */
+    }
+
     parts.push(
       ``,
-      `Use the Execute, WriteFile, ReadFile, ListDirectory, UploadFile, DownloadFile, or ComputerStatus tools to interact with the computer.`,
+      `Tools: Execute, WriteFile, AppendFile, ReadFile, StrReplace, InsertLines, ListDirectory, MoveFile, CopyFile, SearchInFiles, SetEnvVar, UploadFile, DownloadFile, ExecuteBackground, ReadProcessLogs, KillBackground, KillProcess, ComputerStatus, RestartComputer, RebuildComputer, ResetShell.`,
     );
 
     return parts.join("\n");
@@ -112,13 +124,11 @@ export async function promptPreprocessor(
   advanceTurn(cfg.maxToolCalls);
 
   if (!cfg.autoInject) return userMessage;
-
   if (userMessage.length < 5) return userMessage;
 
   try {
     const context = await buildContextBlock(cfg);
     if (!context) return userMessage;
-
     return `${context}\n\n---\n\n${userMessage}`;
   } catch {
     return userMessage;

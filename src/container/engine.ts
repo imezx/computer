@@ -3,10 +3,6 @@
  * Container lifecycle engine — creates, starts, stops, and executes
  * commands inside the model's dedicated Linux computer.
  *
- * All container operations go through this module. The engine is
- * lazy-initialized: the container is only created/started when the
- * first tool call happens.
- *
  * Supports Docker and Podman interchangeably via the detected runtime.
  */
 
@@ -39,11 +35,6 @@ import type { ContainerImage, ContainerState, NetworkMode } from "../constants";
 
 const execAsync = promisify(execFile);
 
-/**
- * Convert a Windows host path (C:\Users\foo) to the format Docker
- * on Windows expects for volume mounts (//c/Users/foo).
- * No-op on Linux/Mac.
- */
 function toDockerPath(hostPath: string): string {
   if (process.platform !== "win32") return hostPath;
   return hostPath
@@ -51,26 +42,26 @@ function toDockerPath(hostPath: string): string {
     .replace(/\\/g, "/");
 }
 
-/**
- * Augment PATH with platform-specific locations where Docker/Podman
- * helper binaries live, so they're findable regardless of what PATH
- * LM Studio inherited from the OS launcher.
- */
+/** Shell-escape a string for use inside single quotes. */
+function q(p: string): string {
+  return p.replace(/'/g, "'\\''");
+}
+
 function getRuntimeEnv(): NodeJS.ProcessEnv {
   const base = process.env.PATH ?? "";
   const extra =
     process.platform === "win32"
       ? [
-          "C:\\Program Files\\Docker\\Docker\\resources\\bin",
-          "C:\\Program Files\\Docker\\Docker\\resources",
-        ]
+        "C:\\Program Files\\Docker\\Docker\\resources\\bin",
+        "C:\\Program Files\\Docker\\Docker\\resources",
+      ]
       : [
-          "/usr/bin",
-          "/usr/local/bin",
-          "/usr/lib/podman",
-          "/usr/libexec/podman",
-          "/bin",
-        ];
+        "/usr/bin",
+        "/usr/local/bin",
+        "/usr/lib/podman",
+        "/usr/libexec/podman",
+        "/bin",
+      ];
 
   const sep = process.platform === "win32" ? ";" : ":";
   return {
@@ -79,11 +70,6 @@ function getRuntimeEnv(): NodeJS.ProcessEnv {
   };
 }
 
-/**
- * Ensure Podman's containers.conf has explicit DNS servers set.
- * This fixes DNS resolution failures in rootless containers on Ubuntu/systemd-resolved hosts.
- * Safe to call multiple times — only writes if the config is missing or incomplete.
- */
 function ensurePodmanConfig(): void {
   try {
     const configDir = join(homedir(), ".config", "containers");
@@ -96,32 +82,28 @@ function ensurePodmanConfig(): void {
 
     const needsDNS = !existing.includes("dns_servers");
     const needsHelperDir = !existing.includes("helper_binaries_dir");
-
     if (!needsDNS && !needsHelperDir) return;
 
     mkdirSync(configDir, { recursive: true });
-
     let updated = existing;
 
     if (needsHelperDir) {
-      const helperLine =
+      const line =
         'helper_binaries_dir = ["/usr/bin", "/usr/local/bin", "/usr/lib/podman"]';
       updated = updated.includes("[network]")
-        ? updated.replace("[network]", `[network]\n${helperLine}`)
-        : updated + `\n[network]\n${helperLine}\n`;
+        ? updated.replace("[network]", `[network]\n${line}`)
+        : updated + `\n[network]\n${line}\n`;
     }
 
     if (needsDNS) {
-      const dnsLine = 'dns_servers = ["8.8.8.8", "8.8.4.4"]';
+      const line = 'dns_servers = ["8.8.8.8", "8.8.4.4"]';
       updated = updated.includes("[containers]")
-        ? updated.replace("[containers]", `[containers]\n${dnsLine}`)
-        : updated + `\n[containers]\n${dnsLine}\n`;
+        ? updated.replace("[containers]", `[containers]\n${line}`)
+        : updated + `\n[containers]\n${line}\n`;
     }
 
     writeFileSync(configPath, updated, "utf-8");
-    console.log(
-      "[lms-computer] Auto-configured Podman containers.conf (helper_binaries_dir + dns_servers).",
-    );
+    console.log("[lms-computer] Auto-configured Podman containers.conf.");
   } catch (err) {
     console.warn("[lms-computer] Could not write Podman config:", err);
   }
@@ -130,8 +112,8 @@ function ensurePodmanConfig(): void {
 let runtime: RuntimeInfo | null = null;
 let containerName: string = "";
 let containerReady: boolean = false;
-let currentNetwork: NetworkMode = "none";
 let initPromise: Promise<void> | null = null;
+let currentNetwork: NetworkMode = "none";
 
 interface ShellSession {
   proc: ReturnType<typeof spawn>;
@@ -145,17 +127,65 @@ const SENTINEL = `__LMS_DONE_${Math.random().toString(36).slice(2)}__`;
 const SENTINEL_NL = SENTINEL + "\n";
 
 /**
- * Get the shell path for the given image.
+ * Truncate large output by keeping the head and tail with an omission
+ * notice in the middle — like Claude's own bash tool.
+ * The beginning (setup) and end (result/error) are almost always what matters.
  */
+function smartTruncate(
+  text: string,
+  maxBytes: number,
+): { text: string; truncated: boolean; linesOmitted: number } {
+  if (Buffer.byteLength(text, "utf-8") <= maxBytes) {
+    return { text, truncated: false, linesOmitted: 0 };
+  }
+
+  const lines = text.split("\n");
+  const headBudget = Math.floor(maxBytes * 0.45);
+  const tailBudget = Math.floor(maxBytes * 0.45);
+
+  const headLines: string[] = [];
+  let headUsed = 0;
+  for (const line of lines) {
+    const lb = Buffer.byteLength(line + "\n", "utf-8");
+    if (headUsed + lb > headBudget) break;
+    headLines.push(line);
+    headUsed += lb;
+  }
+
+  const tailLines: string[] = [];
+  let tailUsed = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const lb = Buffer.byteLength(line + "\n", "utf-8");
+    if (tailUsed + lb > tailBudget) break;
+    tailLines.unshift(line);
+    tailUsed += lb;
+  }
+
+  const omitted = lines.length - headLines.length - tailLines.length;
+  if (omitted <= 0) {
+    return {
+      text: text.slice(0, maxBytes) + "\n… [output truncated]",
+      truncated: true,
+      linesOmitted: 0,
+    };
+  }
+
+  const joined = [
+    ...headLines,
+    "",
+    `… [${omitted} lines omitted — use ReadFile with startLine/endLine to inspect the full output] …`,
+    "",
+    ...tailLines,
+  ].join("\n");
+
+  return { text: joined, truncated: true, linesOmitted: omitted };
+}
+
 function shellFor(image: string): string {
   return image.startsWith("alpine") ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
 }
 
-/**
- * Start a persistent bash session inside the container.
- * The session stays alive across multiple Execute calls so that
- * cd, export, source, nvm use, conda activate, etc. all persist.
- */
 function startShellSession(): ShellSession {
   if (!runtime) throw new Error("Runtime not initialized");
 
@@ -165,10 +195,7 @@ function startShellSession(): ShellSession {
   const proc = spawn(
     runtime.path,
     ["exec", "-i", "-w", CONTAINER_WORKDIR, containerName, shell],
-    {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: getRuntimeEnv(),
-    },
+    { stdio: ["pipe", "pipe", "pipe"], env: getRuntimeEnv() },
   );
 
   const init = [
@@ -176,6 +203,7 @@ function startShellSession(): ShellSession {
     "export PS2=''",
     "export TERM=xterm-256color",
     `cd ${CONTAINER_WORKDIR}`,
+    `[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true`,
     "",
   ].join("\n");
   proc.stdin?.write(init);
@@ -184,39 +212,22 @@ function startShellSession(): ShellSession {
     proc,
     write: (data: string) => proc.stdin?.write(data),
     kill: () => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        /* ignore */
-      }
+      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
     },
   };
 
-  proc.on("exit", () => {
-    if (shellSession === session) shellSession = null;
-  });
-
-  proc.on("error", () => {
-    if (shellSession === session) shellSession = null;
-  });
+  proc.on("exit", () => { if (shellSession === session) shellSession = null; });
+  proc.on("error", () => { if (shellSession === session) shellSession = null; });
 
   return session;
 }
 
-/**
- * Execute a command through the persistent shell session.
- * State (cwd, env vars, sourced files) persists across calls.
- */
 async function execInSession(
   command: string,
   timeoutSeconds: number,
   maxOutputBytes: number,
 ): Promise<ExecResult> {
-  if (
-    !shellSession ||
-    shellSession.proc.exitCode !== null ||
-    shellSession.proc.killed
-  ) {
+  if (!shellSession || shellSession.proc.exitCode !== null || shellSession.proc.killed) {
     shellSession = startShellSession();
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -226,7 +237,7 @@ async function execInSession(
   const effectiveMax = Math.min(maxOutputBytes, MAX_OUTPUT_BYTES);
 
   return new Promise<ExecResult>((resolve) => {
-    let stdout = "";
+    let rawStdout = "";
     let stderr = "";
     let done = false;
 
@@ -242,29 +253,30 @@ async function execInSession(
       cleanup();
 
       let exitCode = 0;
-      const exitMatch = stdout.match(/\nEXIT_CODE:(\d+)\n?$/);
+      const exitMatch = rawStdout.match(/\nEXIT_CODE:(\d+)\n?$/);
       if (exitMatch) {
         exitCode = parseInt(exitMatch[1], 10);
-        stdout = stdout.slice(0, exitMatch.index);
+        rawStdout = rawStdout.slice(0, exitMatch.index);
       }
+      rawStdout = rawStdout.replace(new RegExp(SENTINEL + "\\n?$"), "").trimEnd();
 
-      stdout = stdout.replace(new RegExp(SENTINEL + "\\n?$"), "").trimEnd();
+      const { text: stdout, truncated, linesOmitted } = smartTruncate(rawStdout, effectiveMax);
 
       resolve({
         exitCode: killed ? 137 : exitCode,
-        stdout: stdout.slice(0, effectiveMax),
+        stdout,
         stderr: stderr.slice(0, effectiveMax),
         timedOut,
         durationMs: Date.now() - start,
-        truncated:
-          stdout.length >= effectiveMax || stderr.length >= effectiveMax,
+        truncated,
+        originalSize: linesOmitted > 0 ? rawStdout.length : undefined,
       });
     };
 
     const onStdout = (chunk: Buffer) => {
       if (done) return;
-      stdout += chunk.toString("utf-8");
-      if (stdout.includes(SENTINEL_NL) || stdout.endsWith(SENTINEL)) {
+      rawStdout += chunk.toString("utf-8");
+      if (rawStdout.includes(SENTINEL_NL) || rawStdout.endsWith(SENTINEL)) {
         finish(false, false);
       }
     };
@@ -289,13 +301,7 @@ async function execInSession(
   });
 }
 
-/**
- * Run a container runtime command and return stdout.
- */
-async function run(
-  args: string[],
-  timeoutMs: number = 30_000,
-): Promise<string> {
+async function run(args: string[], timeoutMs: number = 30_000): Promise<string> {
   if (!runtime) throw new Error("Runtime not initialized");
   const { stdout } = await execAsync(runtime.path, args, {
     timeout: timeoutMs,
@@ -305,121 +311,85 @@ async function run(
   return stdout.trim();
 }
 
-/**
- * Check current state of the managed container.
- */
 async function getContainerState(): Promise<ContainerState> {
   try {
-    const out = await run([
-      "inspect",
-      containerName,
-      "--format",
-      "{{.State.Status}}",
-    ]);
+    const out = await run(["inspect", containerName, "--format", "{{.State.Status}}"]);
     const status = out.trim().toLowerCase();
     if (status === "running") return "running";
-    if (["exited", "stopped", "created", "paused", "dead"].includes(status))
-      return "stopped";
+    if (["exited", "stopped", "created", "paused", "dead"].includes(status)) return "stopped";
     return "error";
   } catch {
     return "not_found";
   }
 }
 
-/**
- * Build `docker run` / `podman run` arguments from options.
- */
 function buildRunArgs(opts: ContainerCreateOptions): string[] {
   const args: string[] = [
-    "run",
-    "-d",
-    "--name",
-    opts.name,
-    "--hostname",
-    "lms-computer",
+    "run", "-d",
+    "--name", opts.name,
+    "--hostname", "lms-computer",
     ...(opts.network !== "podman-default" ? ["--network", opts.network] : []),
-    ...(opts.network !== "none"
-      ? ["--dns", "8.8.8.8", "--dns", "8.8.4.4"]
-      : []),
-    "-w",
-    "/root",
+    ...(opts.network !== "none" ? ["--dns", "8.8.8.8", "--dns", "8.8.4.4"] : []),
+    "-w", "/root",
   ];
 
-  if (opts.cpuLimit > 0) {
-    args.push("--cpus", String(opts.cpuLimit));
-  }
+  if (opts.cpuLimit > 0) args.push("--cpus", String(opts.cpuLimit));
   if (opts.memoryLimitMB > 0) {
     args.push("--memory", `${opts.memoryLimitMB}m`);
-    args.push("--memory-swap", `${opts.memoryLimitMB}m`);
+    // wsl2 kernel often lacks swap cgroup accounting so
+    if (process.platform !== "win32") {
+      args.push("--memory-swap", `${opts.memoryLimitMB}m`);
+    }
   }
 
-  for (const [k, v] of Object.entries(opts.envVars)) {
-    args.push("-e", `${k}=${v}`);
-  }
-
-  for (const pf of opts.portForwards) {
-    const trimmed = pf.trim();
-    if (trimmed) args.push("-p", trimmed);
-  }
-
-  if (opts.hostMountPath) {
-    args.push("-v", `${toDockerPath(opts.hostMountPath)}:/mnt/shared`);
-  }
+  for (const [k, v] of Object.entries(opts.envVars)) args.push("-e", `${k}=${v}`);
+  for (const pf of opts.portForwards) { const t = pf.trim(); if (t) args.push("-p", t); }
+  if (opts.hostMountPath) args.push("-v", `${toDockerPath(opts.hostMountPath)}:/mnt/shared`);
 
   args.push(opts.image, "tail", "-f", "/dev/null");
-
   return args;
 }
 
-/**
- * Create the user workspace and install packages inside the container.
- */
 async function setupContainer(
   image: ContainerImage,
   preset: string,
   hasNetwork: boolean = false,
 ): Promise<void> {
+  const isAlpine = image.startsWith("alpine");
   const shell = shellFor(image);
 
-  await run(
+  await execAsync(
+    runtime!.path,
     [
-      "exec",
-      containerName,
-      shell,
-      "-c",
-      `mkdir -p ${CONTAINER_WORKDIR} && ` +
-        `(id user >/dev/null 2>&1 || adduser --disabled-password --gecos "" --home ${CONTAINER_WORKDIR} user 2>/dev/null || ` +
-        `adduser -D -h ${CONTAINER_WORKDIR} user 2>/dev/null || true)`,
+      "exec", containerName, shell, "-c",
+      `mkdir -p ${CONTAINER_WORKDIR} && chown root:root ${CONTAINER_WORKDIR} && ` +
+      `touch ~/.bashrc ~/.profile && ` +
+      `grep -q 'source ~/.bashrc' ~/.profile 2>/dev/null || ` +
+      `echo 'source ~/.bashrc 2>/dev/null || true' >> ~/.profile`,
     ],
-    15_000,
+    { timeout: 30_000, env: getRuntimeEnv() },
   );
 
-  if (preset && preset !== "none" && hasNetwork) {
-    const isAlpine = image.startsWith("alpine");
-    const presets = isAlpine ? PACKAGE_PRESETS_ALPINE : PACKAGE_PRESETS;
-    const packages = presets[preset];
-    if (packages && packages.length > 0) {
-      const installCmd = isAlpine
-        ? `apk update && apk add --no-cache ${packages.join(" ")}`
-        : `apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${packages.join(" ")} && apt-get clean && rm -rf /var/lib/apt/lists/*`;
+  if (preset === "none" || !hasNetwork) return;
 
-      try {
-        await run(["exec", containerName, shell, "-c", installCmd], 180_000);
-      } catch (installErr: any) {
-        console.warn(
-          "[lms-computer] Package install failed (non-fatal):",
-          installErr?.message ?? installErr,
-        );
-      }
-    }
-  }
+  const packages = isAlpine
+    ? (PACKAGE_PRESETS_ALPINE[preset] ?? [])
+    : (PACKAGE_PRESETS[preset] ?? []);
+  if (packages.length === 0) return;
+
+  const installCmd = isAlpine
+    ? `apk add --no-cache ${packages.join(" ")}`
+    : `DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y --no-install-recommends ${packages.join(" ")} && rm -rf /var/lib/apt/lists/*`;
+
+  await execAsync(runtime!.path, ["exec", containerName, shell, "-c", installCmd], {
+    timeout: 300_000,
+    env: getRuntimeEnv(),
+  }).catch((e: Error) => {
+    console.warn("[lms-computer] Package install failed (non-fatal):", e.message);
+  });
 }
 
-/**
- * Initialize the container engine: detect runtime, create or start
- * the container if needed. Safe to call multiple times (idempotent).
- */
-export async function ensureReady(opts: {
+export interface EnsureReadyOptions {
   image: ContainerImage;
   network: NetworkMode;
   cpuLimit: number;
@@ -429,73 +399,26 @@ export async function ensureReady(opts: {
   portForwards: string;
   hostMountPath: string;
   persistenceMode: string;
-}): Promise<void> {
-  if (containerReady) {
-    const wantsNetwork = opts.network !== "none";
-    const hasNetwork = currentNetwork !== "none";
-    if (wantsNetwork === hasNetwork) return;
+}
 
-    containerReady = false;
-    currentNetwork = "none";
-    try {
-      await run(["stop", containerName], 15_000);
-    } catch {
-      /* ignore */
-    }
-    try {
-      await run(["rm", "-f", containerName], 10_000);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (initPromise) return initPromise;
+export async function ensureReady(opts: EnsureReadyOptions): Promise<void> {
+  if (containerReady) return;
+  if (initPromise) { await initPromise; return; }
 
   initPromise = (async () => {
-    runtime = await detectRuntime();
-    containerName = `${CONTAINER_NAME_PREFIX}-main`;
-
-    if (runtime.kind === "podman") {
-      ensurePodmanConfig();
+    if (!runtime) {
+      runtime = await detectRuntime();
+      containerName = `${CONTAINER_NAME_PREFIX}-main`;
+      if (runtime.kind === "podman") ensurePodmanConfig();
     }
 
     const state = await getContainerState();
 
-    if (state === "running") {
-      let actuallyHasNetwork = false;
-      try {
-        const netOut = await run([
-          "inspect",
-          containerName,
-          "--format",
-          "{{.HostConfig.NetworkMode}}",
-        ]);
-        const actualNet = netOut.trim().toLowerCase();
-        actuallyHasNetwork = actualNet !== "none" && actualNet !== "";
-      } catch {
-        /* assume no network */
-      }
+    if (state === "running") { containerReady = true; return; }
 
-      const wantsNetwork = opts.network !== "none";
-
-      if (actuallyHasNetwork === wantsNetwork) {
-        currentNetwork = wantsNetwork ? opts.network : "none";
-        containerReady = true;
-        return;
-      }
-
-      console.log(
-        `[lms-computer] Network mismatch (container has ${actuallyHasNetwork ? "internet" : "no internet"}, settings want ${wantsNetwork ? "internet" : "no internet"}) — recreating container.`,
-      );
-      try {
-        await run(["stop", containerName], 15_000);
-      } catch {
-        /* already stopped */
-      }
-      try {
-        await run(["rm", "-f", containerName], 10_000);
-      } catch {
-        /* already gone */
-      }
+    if (opts.persistenceMode === "ephemeral" && state !== "not_found") {
+      try { await run(["stop", containerName], 15_000); } catch { }
+      try { await run(["rm", "-f", containerName], 10_000); } catch { }
     }
 
     if (state === "stopped") {
@@ -505,32 +428,17 @@ export async function ensureReady(opts: {
         return;
       } catch (err: any) {
         const msg: string = err?.message ?? "";
-        if (
-          msg.includes("workdir") ||
-          msg.includes("does not exist") ||
-          msg.includes("netns") ||
-          msg.includes("mount runtime")
-        ) {
-          try {
-            await run(["rm", "-f", containerName], 10_000);
-          } catch {
-            /* ignore */
-          }
-        } else {
-          throw err;
-        }
+        if (msg.includes("workdir") || msg.includes("does not exist") ||
+          msg.includes("netns") || msg.includes("mount runtime")) {
+          try { await run(["rm", "-f", containerName], 10_000); } catch { }
+        } else { throw err; }
       }
     }
 
-    try {
-      await run(["pull", opts.image], 300_000);
-    } catch {}
+    try { await run(["pull", opts.image], 300_000); } catch { }
 
     const portForwards = opts.portForwards
-      ? opts.portForwards
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean)
+      ? opts.portForwards.split(",").map((s) => s.trim()).filter(Boolean)
       : [];
 
     let setupNetwork: NetworkMode | "podman-default" = "none";
@@ -539,6 +447,7 @@ export async function ensureReady(opts: {
     } else if (runtime?.kind === "podman" && opts.network !== "none") {
       setupNetwork = "podman-default";
     }
+
     const createArgs = buildRunArgs({
       image: opts.image,
       name: containerName,
@@ -552,49 +461,53 @@ export async function ensureReady(opts: {
       hostMountPath: opts.hostMountPath || null,
     });
 
+    // --storage-opt is not supported on docker desktop win (overlayfs)
     const diskOptArgs = [...createArgs];
-    if (opts.diskLimitMB > 0) {
-      diskOptArgs.splice(
-        diskOptArgs.indexOf(opts.image),
-        0,
-        "--storage-opt",
-        `size=${opts.diskLimitMB}m`,
-      );
-    }
-    try {
-      await run(diskOptArgs, 60_000);
-    } catch (err: any) {
-      const msg: string = err?.message ?? "";
-      if (
-        msg.includes("storage-opt") ||
-        msg.includes("backingFS") ||
-        msg.includes("overlay.size")
-      ) {
-        console.warn(
-          "[lms-computer] Disk quota not supported by storage driver, starting without size limit.",
-        );
-        await run(createArgs, 60_000);
-      } else {
-        throw err;
-      }
+    if (opts.diskLimitMB > 0 && process.platform !== "win32") {
+      diskOptArgs.splice(diskOptArgs.indexOf(opts.image), 0,
+        "--storage-opt", `size=${opts.diskLimitMB}m`);
     }
 
+    const stripResourceFlags = (args: string[]): string[] =>
+      args.filter((a, i, arr) => {
+        const prev = arr[i - 1] ?? "";
+        return (
+          a !== "--memory" && a !== "--memory-swap" &&
+          a !== "--cpus" && a !== "--storage-opt" &&
+          !prev.match(/^--(memory|memory-swap|cpus|storage-opt)$/)
+        );
+      });
+
+    const tryRun = async (args: string[]): Promise<void> => {
+      try {
+        await run(args, 60_000);
+      } catch (err: any) {
+        const msg: string = err?.message ?? "";
+        if (msg.includes("storage-opt") || msg.includes("backingFS") || msg.includes("overlay.size")) {
+          console.warn("[lms-computer] Disk quota not supported, retrying without --storage-opt.");
+          const noStorage = args.filter((a, i, arr) =>
+            a !== "--storage-opt" && !(arr[i - 1] === "--storage-opt")
+          );
+          await tryRun(noStorage);
+        } else if (msg.includes("memory") || msg.includes("cpus") ||
+          msg.includes("cgroup") || msg.includes("resource")) {
+          console.warn("[lms-computer] Resource limits not supported, retrying without them.");
+          await run(stripResourceFlags(createArgs), 60_000);
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    await tryRun(diskOptArgs);
+
     const hasNetworkForSetup = setupNetwork !== "none";
-    await setupContainer(
-      opts.image,
-      opts.autoInstallPreset,
-      hasNetworkForSetup,
-    );
+    await setupContainer(opts.image, opts.autoInstallPreset, hasNetworkForSetup);
 
     if (opts.network === "none" && setupNetwork !== "none") {
       try {
-        await run(
-          ["network", "disconnect", setupNetwork, containerName],
-          10_000,
-        );
-      } catch {
-        /* best effort — container still works, just has network */
-      }
+        await run(["network", "disconnect", setupNetwork, containerName], 10_000);
+      } catch { /* best effort */ }
     }
 
     currentNetwork = setupNetwork !== "none" ? opts.network : "none";
@@ -608,165 +521,120 @@ export async function ensureReady(opts: {
   }
 }
 
-/**
- * Execute a command inside the container.
- */
 export async function exec(
   command: string,
   timeoutSeconds: number,
   maxOutputBytes: number = DEFAULT_MAX_OUTPUT_BYTES,
   workdir?: string,
 ): Promise<ExecResult> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready. Call ensureReady() first.");
-  }
-
-  const cmdToRun =
-    workdir && workdir !== CONTAINER_WORKDIR
-      ? `cd ${workdir} && ${command}`
-      : command;
-
+  if (!runtime || !containerReady) throw new Error("Container not ready. Call ensureReady() first.");
+  const cmdToRun = workdir && workdir !== CONTAINER_WORKDIR
+    ? `cd ${workdir} && ${command}` : command;
   return execInSession(cmdToRun, timeoutSeconds, maxOutputBytes);
 }
 
-/**
- * Write a file inside the container using stdin piping.
- */
-export async function writeFile(
-  filePath: string,
-  content: string,
-): Promise<void> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready.");
-  }
-
+export async function writeFile(filePath: string, content: string): Promise<void> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
   return new Promise<void>((resolve, reject) => {
-    const shell = containerName.includes("alpine")
-      ? CONTAINER_SHELL_ALPINE
-      : CONTAINER_SHELL;
-    const proc = spawn(
-      runtime!.path,
-      [
-        "exec",
-        "-i",
-        containerName,
-        shell,
-        "-c",
-        `cat > '${filePath.replace(/'/g, "'\\''")}'`,
-      ],
-      {
-        timeout: 15_000,
-        stdio: ["pipe", "ignore", "pipe"],
-        env: getRuntimeEnv(),
-      },
-    );
-
+    const shell = containerName.includes("alpine") ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
+    const proc = spawn(runtime!.path, ["exec", "-i", containerName, shell, "-c", `cat > '${q(filePath)}'`], {
+      timeout: 15_000, stdio: ["pipe", "ignore", "pipe"], env: getRuntimeEnv(),
+    });
     let stderr = "";
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Write failed (exit ${code}): ${stderr}`));
-    });
+    proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on("close", (code) => { code === 0 ? resolve() : reject(new Error(`Write failed (exit ${code}): ${stderr}`)); });
     proc.on("error", reject);
     proc.stdin?.write(content);
     proc.stdin?.end();
   });
 }
 
-/**
- * Read a file from the container, optionally limited to a line range.
- */
+export async function appendFile(filePath: string, content: string): Promise<void> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  return new Promise<void>((resolve, reject) => {
+    const shell = containerName.includes("alpine") ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
+    const proc = spawn(runtime!.path, ["exec", "-i", containerName, shell, "-c", `cat >> '${q(filePath)}'`], {
+      timeout: 15_000, stdio: ["pipe", "ignore", "pipe"], env: getRuntimeEnv(),
+    });
+    let stderr = "";
+    proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on("close", (code) => { code === 0 ? resolve() : reject(new Error(`Append failed (exit ${code}): ${stderr}`)); });
+    proc.on("error", reject);
+    proc.stdin?.write(content);
+    proc.stdin?.end();
+  });
+}
+
 export async function readFile(
   filePath: string,
   maxBytes: number,
   startLine?: number,
   endLine?: number,
 ): Promise<{ content: string; totalLines: number }> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready.");
-  }
-
-  const q = filePath.replace(/'/g, "'\\''");
-  const totalResult = await exec(`wc -l < '${q}' 2>/dev/null || echo 0`, 5);
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const qp = q(filePath);
+  const totalResult = await exec(`wc -l < '${qp}' 2>/dev/null || echo 0`, 5);
   const totalLines = parseInt(totalResult.stdout.trim(), 10) || 0;
 
   let cmd: string;
   if (startLine !== undefined && endLine !== undefined) {
-    cmd = `sed -n '${startLine},${endLine}p' '${q}'`;
+    cmd = `sed -n '${startLine},${endLine}p' '${qp}'`;
   } else if (startLine !== undefined) {
-    cmd = `tail -n +${startLine} '${q}'`;
+    cmd = `tail -n +${startLine} '${qp}'`;
   } else {
-    cmd = `cat '${q}'`;
+    cmd = `cat '${qp}'`;
   }
 
   const result = await exec(cmd, 10, maxBytes);
-  if (result.exitCode !== 0) {
-    throw new Error(`Read failed: ${result.stderr || "file not found"}`);
-  }
+  if (result.exitCode !== 0) throw new Error(`Read failed: ${result.stderr || "file not found"}`);
   return { content: result.stdout, totalLines };
 }
 
 /**
- * Replace an exact string in a file. Fails if the string is not found
- * or appears more than once, matching the behaviour of surgical editors.
+ * Replace one or more exact strings in a file.
+ * All replacements are applied in order and the file is written once.
+ * Each oldStr must appear exactly once.
  */
 export async function strReplaceInFile(
   filePath: string,
-  oldStr: string,
-  newStr: string,
+  replacements: Array<{ oldStr: string; newStr: string }>,
 ): Promise<{ replacements: number }> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready.");
-  }
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const qp = q(filePath);
+  const readResult = await exec(`cat '${qp}'`, 10, MAX_OUTPUT_BYTES);
+  if (readResult.exitCode !== 0) throw new Error(`File not found: ${filePath}`);
 
-  const q = filePath.replace(/'/g, "'\\''");
-  const readResult = await exec(`cat '${q}'`, 10, MAX_OUTPUT_BYTES);
-  if (readResult.exitCode !== 0) {
-    throw new Error(`File not found: ${filePath}`);
-  }
-
-  const original = readResult.stdout;
-  const occurrences = original.split(oldStr).length - 1;
-
-  if (occurrences === 0) {
-    throw new Error(
-      `String not found in ${filePath}.\n` +
+  let content = readResult.stdout;
+  for (const { oldStr, newStr } of replacements) {
+    const occurrences = content.split(oldStr).length - 1;
+    if (occurrences === 0) {
+      throw new Error(
+        `String not found in ${filePath}:\n"${oldStr.slice(0, 80)}"\n` +
         `Hint: use ReadFile to view the current contents before editing.`,
-    );
-  }
-  if (occurrences > 1) {
-    throw new Error(
-      `String appears ${occurrences} times in ${filePath} — it must be unique.\n` +
+      );
+    }
+    if (occurrences > 1) {
+      throw new Error(
+        `String appears ${occurrences} times in ${filePath} — it must be unique.\n` +
         `Hint: include more surrounding context to make the match unique.`,
-    );
+      );
+    }
+    content = content.replace(oldStr, newStr);
   }
 
-  const updated = original.replace(oldStr, newStr);
-  await writeFile(filePath, updated);
-  return { replacements: 1 };
+  await writeFile(filePath, content);
+  return { replacements: replacements.length };
 }
 
-/**
- * Insert lines into a file at a given line number.
- * Line numbers are 1-based. Pass 0 to prepend, or a number past EOF to append.
- */
 export async function insertLinesInFile(
   filePath: string,
   afterLine: number,
   content: string,
 ): Promise<void> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready.");
-  }
-
-  const q = filePath.replace(/'/g, "'\\''");
-  const readResult = await exec(`cat '${q}'`, 10, MAX_OUTPUT_BYTES);
-  if (readResult.exitCode !== 0) {
-    throw new Error(`File not found: ${filePath}`);
-  }
-
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const qp = q(filePath);
+  const readResult = await exec(`cat '${qp}'`, 10, MAX_OUTPUT_BYTES);
+  if (readResult.exitCode !== 0) throw new Error(`File not found: ${filePath}`);
   const lines = readResult.stdout.split("\n");
   const insertLines = content.split("\n");
   const clampedLine = Math.max(0, Math.min(afterLine, lines.length));
@@ -774,117 +642,217 @@ export async function insertLinesInFile(
   await writeFile(filePath, lines.join("\n"));
 }
 
-const bgLogs = new Map<
-  number,
-  { stdout: string; stderr: string; done: boolean; exitCode: number | null }
->();
+export async function moveFile(src: string, dest: string): Promise<void> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const destDir = dest.includes("/") ? dest.slice(0, dest.lastIndexOf("/")) : ".";
+  const result = await exec(
+    `mkdir -p '${q(destDir)}' 2>/dev/null; mv '${q(src)}' '${q(dest)}'`, 10);
+  if (result.exitCode !== 0) throw new Error(`Move failed: ${result.stderr || "unknown error"}`);
+}
 
-/**
- * Run a command in the background inside the container.
- * Returns a handle ID that can be used with readBgLogs.
- */
+export async function copyFile(src: string, dest: string): Promise<void> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const destDir = dest.includes("/") ? dest.slice(0, dest.lastIndexOf("/")) : ".";
+  const result = await exec(
+    `mkdir -p '${q(destDir)}' 2>/dev/null; cp -r '${q(src)}' '${q(dest)}'`, 10);
+  if (result.exitCode !== 0) throw new Error(`Copy failed: ${result.stderr || "unknown error"}`);
+}
+
+export async function searchInFiles(
+  pattern: string,
+  dir: string,
+  options: { ignoreCase?: boolean; glob?: string; maxResults?: number } = {},
+): Promise<{ matches: string; count: number; truncated: boolean }> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  const { ignoreCase, glob, maxResults = 200 } = options;
+
+  const flags = [
+    "-rn", "--color=never",
+    ignoreCase ? "-i" : "",
+    glob ? `--include='${glob}'` : "",
+    `--exclude-dir='.git' --exclude-dir='node_modules' --exclude-dir='.cache'`,
+  ].filter(Boolean).join(" ");
+
+  const escapedPattern = q(pattern);
+  const cmd = `grep ${flags} '${escapedPattern}' '${q(dir)}' 2>/dev/null | head -${maxResults + 1}`;
+  const result = await exec(cmd, 15, DEFAULT_MAX_OUTPUT_BYTES);
+  const lines = result.stdout.trim() ? result.stdout.trim().split("\n") : [];
+  const truncated = lines.length > maxResults;
+  const displayLines = truncated ? lines.slice(0, maxResults) : lines;
+
+  return {
+    matches: displayLines.join("\n") || "(no matches)",
+    count: displayLines.length,
+    truncated,
+  };
+}
+
+export async function setEnvVar(key: string, value: string): Promise<void> {
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+    throw new Error(
+      `Invalid env var name: "${key}". Must match [A-Za-z_][A-Za-z0-9_]*`,
+    );
+  }
+  const escaped = q(value);
+  const cmd =
+    `sed -i '/^export ${key}=/d' ~/.bashrc 2>/dev/null; ` +
+    `echo "export ${key}='${escaped}'" >> ~/.bashrc; ` +
+    `export ${key}='${escaped}'`;
+  const result = await exec(cmd, 5);
+  if (result.exitCode !== 0) throw new Error(`Failed to set env var: ${result.stderr}`);
+}
+
+interface BgEntry {
+  stdout: string;
+  stderr: string;
+  done: boolean;
+  exitCode: number | null;
+  proc: ReturnType<typeof spawn> | null;
+  command: string;
+  startedAt: number;
+}
+
+const bgLogs = new Map<number, BgEntry>();
+
 export async function execBackground(
   command: string,
   timeoutSeconds: number,
 ): Promise<{ handleId: number; pid: number }> {
-  if (!runtime || !containerReady) {
-    throw new Error("Container not ready.");
-  }
+  if (!runtime || !containerReady) throw new Error("Container not ready.");
 
-  const shell = containerName.includes("alpine")
-    ? CONTAINER_SHELL_ALPINE
-    : CONTAINER_SHELL;
+  const shell = containerName.includes("alpine") ? CONTAINER_SHELL_ALPINE : CONTAINER_SHELL;
   const handleId = Date.now();
-  const entry = {
-    stdout: "",
-    stderr: "",
-    done: false,
-    exitCode: null as number | null,
+  const entry: BgEntry = {
+    stdout: "", stderr: "", done: false, exitCode: null, proc: null,
+    command, startedAt: Date.now(),
   };
   bgLogs.set(handleId, entry);
 
-  const proc = spawn(
-    runtime.path,
-    ["exec", containerName, shell, "-c", command],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: getRuntimeEnv(),
-    },
-  );
+  const proc = spawn(runtime.path, ["exec", containerName, shell, "-c", command], {
+    stdio: ["ignore", "pipe", "pipe"], env: getRuntimeEnv(),
+  });
 
-  const cap = MAX_OUTPUT_BYTES * 2;
+  entry.proc = proc;
+  const cap = MAX_OUTPUT_BYTES * 4;
+
   proc.stdout?.on("data", (chunk: Buffer) => {
     if (entry.stdout.length < cap) entry.stdout += chunk.toString("utf-8");
   });
   proc.stderr?.on("data", (chunk: Buffer) => {
     if (entry.stderr.length < cap) entry.stderr += chunk.toString("utf-8");
   });
+
+  const killTimer = setTimeout(() => {
+    if (!entry.done) {
+      try { proc.kill("SIGKILL"); } catch { }
+      entry.done = true;
+      entry.exitCode = 137;
+      entry.proc = null;
+    }
+  }, timeoutSeconds * 1_000);
+
   proc.on("close", (code) => {
     entry.done = true;
     entry.exitCode = code;
+    entry.proc = null;
+    clearTimeout(killTimer);
   });
-
-  setTimeout(() => {
-    if (!entry.done) {
-      proc.kill("SIGKILL");
-      entry.done = true;
-      entry.exitCode = 137;
-    }
-  }, timeoutSeconds * 1_000);
 
   return { handleId, pid: proc.pid ?? -1 };
 }
 
 /**
- * Read buffered output from a background process by handle ID.
+ * Read buffered output from a background process.
+ * Pass `fromOffset` (the `nextOffset` from the previous call) to receive
+ * only new stdout since the last read — avoids duplicate output on repeated polling.
  */
 export function readBgLogs(
   handleId: number,
   maxBytes: number = DEFAULT_MAX_OUTPUT_BYTES,
+  fromOffset: number = 0,
 ): {
   stdout: string;
   stderr: string;
   done: boolean;
   exitCode: number | null;
   found: boolean;
+  nextOffset: number;
 } {
   const entry = bgLogs.get(handleId);
-  if (!entry)
-    return { stdout: "", stderr: "", done: true, exitCode: null, found: false };
+  if (!entry) {
+    return { stdout: "", stderr: "", done: true, exitCode: null, found: false, nextOffset: 0 };
+  }
+  const newStdout = entry.stdout.slice(fromOffset, fromOffset + maxBytes);
+  const nextOffset = fromOffset + newStdout.length;
   return {
-    stdout: entry.stdout.slice(-maxBytes),
-    stderr: entry.stderr.slice(-maxBytes),
+    stdout: newStdout || "(no new output since last read)",
+    stderr: entry.stderr.slice(-maxBytes) || "",
     done: entry.done,
     exitCode: entry.exitCode,
     found: true,
+    nextOffset,
   };
 }
 
 /**
- * Copy a file from the host into the container.
+ * Kill a background process by handle ID.
+ * Sends SIGTERM then SIGKILL after 2 s if the process hasn't exited.
  */
-export async function copyToContainer(
-  hostPath: string,
-  containerPath: string,
-): Promise<void> {
+export function killBgProcess(handleId: number): {
+  found: boolean;
+  alreadyDone: boolean;
+} {
+  const entry = bgLogs.get(handleId);
+  if (!entry) return { found: false, alreadyDone: false };
+  if (entry.done) return { found: true, alreadyDone: true };
+  if (entry.proc) {
+    try {
+      entry.proc.kill("SIGTERM");
+      setTimeout(() => {
+        if (!entry.done && entry.proc) {
+          try { entry.proc.kill("SIGKILL"); } catch { }
+        }
+      }, 2_000);
+    } catch { }
+  }
+  return { found: true, alreadyDone: false };
+}
+
+/**
+ * List all background processes (running or recently finished).
+ * Used by the preprocessor to inject context about active jobs.
+ */
+export function listBgProcesses(): Array<{
+  handleId: number;
+  command: string;
+  running: boolean;
+  exitCode: number | null;
+  runtimeSecs: number;
+}> {
+  const out = [];
+  for (const [handleId, entry] of bgLogs.entries()) {
+    out.push({
+      handleId,
+      command: entry.command.length > 60 ? entry.command.slice(0, 57) + "…" : entry.command,
+      running: !entry.done,
+      exitCode: entry.exitCode,
+      runtimeSecs: Math.round((Date.now() - entry.startedAt) / 1000),
+    });
+  }
+  return out.sort((a, b) => b.handleId - a.handleId).slice(0, 10);
+}
+
+export async function copyToContainer(hostPath: string, containerPath: string): Promise<void> {
   if (!runtime) throw new Error("Runtime not initialized.");
   await run(["cp", hostPath, `${containerName}:${containerPath}`], 60_000);
 }
 
-/**
- * Copy a file from the container to the host.
- */
-export async function copyFromContainer(
-  containerPath: string,
-  hostPath: string,
-): Promise<void> {
+export async function copyFromContainer(containerPath: string, hostPath: string): Promise<void> {
   if (!runtime) throw new Error("Runtime not initialized.");
   await run(["cp", `${containerName}:${containerPath}`, hostPath], 60_000);
 }
 
-/**
- * Get environment info from inside the container.
- */
 export async function getEnvironmentInfo(
   network: boolean,
   diskLimitMB: number = 0,
@@ -928,34 +896,23 @@ echo "TOOLS=$(which git curl wget vim nano python3 node npm gcc make cmake pip3 
   const diskFreeRawKB = parseInt(get("DISK_FREE_RAW") || "0", 10);
   let diskTotal: string;
   let diskFree: string;
+  const toMiB = (kb: number) =>
+    kb >= 1024 * 1024 ? `${(kb / 1024 / 1024).toFixed(1)}GiB` : `${Math.round(kb / 1024)}MiB`;
+
   if (diskLimitMB > 0) {
     const diskLimitKB = diskLimitMB * 1024;
-    const diskFreeKB = Math.max(0, diskLimitKB - diskUsedKB);
-    const toMiB = (kb: number) =>
-      kb >= 1024 * 1024
-        ? `${(kb / 1024 / 1024).toFixed(1)}GiB`
-        : `${Math.round(kb / 1024)}MiB`;
     diskTotal = toMiB(diskLimitKB);
-    diskFree = toMiB(diskFreeKB);
+    diskFree = toMiB(Math.max(0, diskLimitKB - diskUsedKB));
   } else {
-    const toMiB = (kb: number) =>
-      kb >= 1024 * 1024
-        ? `${(kb / 1024 / 1024).toFixed(1)}GiB`
-        : `${Math.round(kb / 1024)}MiB`;
     diskFree = toMiB(diskFreeRawKB);
     diskTotal = "N/A";
   }
 
   return {
-    os: get("OS"),
-    kernel: get("KERNEL"),
-    arch: get("ARCH"),
-    hostname: get("HOSTNAME"),
-    uptime: get("UPTIME"),
-    diskFree,
-    diskTotal,
-    memoryFree: get("MEM_FREE"),
-    memoryTotal: get("MEM_TOTAL"),
+    os: get("OS"), kernel: get("KERNEL"), arch: get("ARCH"),
+    hostname: get("HOSTNAME"), uptime: get("UPTIME"),
+    diskFree, diskTotal,
+    memoryFree: get("MEM_FREE"), memoryTotal: get("MEM_TOTAL"),
     pythonVersion: get("PYTHON") || null,
     nodeVersion: get("NODE") || null,
     gccVersion: get("GCC") || null,
@@ -965,17 +922,9 @@ echo "TOOLS=$(which git curl wget vim nano python3 node npm gcc make cmake pip3 
   };
 }
 
-/**
- * List processes running inside the container.
- */
 export async function listProcesses(): Promise<ProcessInfo[]> {
-  const result = await exec(
-    "ps aux --no-headers 2>/dev/null || ps aux 2>/dev/null",
-    5,
-  );
-
+  const result = await exec("ps aux --no-headers 2>/dev/null || ps aux 2>/dev/null", 5);
   if (result.exitCode !== 0) return [];
-
   return result.stdout
     .split("\n")
     .filter((line) => line.trim() && !line.includes("ps aux"))
@@ -993,48 +942,19 @@ export async function listProcesses(): Promise<ProcessInfo[]> {
     .filter((p) => p.pid > 0);
 }
 
-/**
- * Kill a process inside the container.
- */
-export async function killProcess(
-  pid: number,
-  signal: string = "SIGTERM",
-): Promise<boolean> {
-  const result = await exec(`kill -${signal} ${pid}`, 5);
+export async function killProcess(pid: number, signal: string = "SIGTERM"): Promise<boolean> {
+  const result = await exec(`kill -${signal} ${pid} 2>&1`, 5);
   return result.exitCode === 0;
 }
 
-/**
- * Stop and optionally remove the container.
- */
 export async function stopContainer(remove: boolean = false): Promise<void> {
   if (!runtime) return;
-
-  if (shellSession) {
-    shellSession.kill();
-    shellSession = null;
-  }
-
-  try {
-    await run(["stop", containerName], 15_000);
-  } catch {
-    /* already stopped */
-  }
-
-  if (remove) {
-    try {
-      await run(["rm", "-f", containerName], 10_000);
-    } catch {
-      /* already removed */
-    }
-  }
-
+  if (shellSession) { shellSession.kill(); shellSession = null; }
+  try { await run(["stop", containerName], 15_000); } catch { }
+  if (remove) { try { await run(["rm", "-f", containerName], 10_000); } catch { } }
   containerReady = false;
 }
 
-/**
- * Destroy the container and all its data.
- */
 export async function destroyContainer(): Promise<void> {
   await stopContainer(true);
   containerReady = false;
@@ -1042,51 +962,27 @@ export async function destroyContainer(): Promise<void> {
   initPromise = null;
 }
 
-/**
- * Restart the container without wiping its data.
- * Stops the running container, kills the shell session, then starts it again.
- * Faster than a full rebuild — filesystem and installed packages are preserved.
- */
 export async function restartContainer(): Promise<void> {
   if (!runtime) throw new Error("Runtime not initialized.");
-  if (shellSession) {
-    shellSession.kill();
-    shellSession = null;
-  }
-  try {
-    await run(["stop", containerName], 15_000);
-  } catch {}
+  if (shellSession) { shellSession.kill(); shellSession = null; }
+  try { await run(["stop", containerName], 15_000); } catch { }
   await run(["start", containerName], 30_000);
   containerReady = true;
 }
 
-/**
- * Get detailed container info.
- */
 export async function getContainerInfo(): Promise<ContainerInfo> {
   if (!runtime) throw new Error("Runtime not initialized.");
-
   const state = await getContainerState();
 
   if (state === "not_found") {
     return {
-      id: "",
-      name: containerName,
-      state: "not_found",
-      image: "",
-      created: "",
-      uptime: null,
-      cpuUsage: null,
-      memoryUsage: null,
-      diskUsage: null,
-      networkMode: "",
-      ports: [],
+      id: "", name: containerName, state: "not_found", image: "", created: "",
+      uptime: null, cpuUsage: null, memoryUsage: null, diskUsage: null, networkMode: "", ports: []
     };
   }
 
   try {
-    const format =
-      "{{.Id}}\t{{.Config.Image}}\t{{.Created}}\t{{.State.Status}}\t{{.HostConfig.NetworkMode}}";
+    const format = "{{.Id}}\t{{.Config.Image}}\t{{.Created}}\t{{.State.Status}}\t{{.HostConfig.NetworkMode}}";
     const out = await run(["inspect", containerName, "--format", format]);
     const [id, image, created, , networkMode] = out.split("\t");
 
@@ -1096,115 +992,58 @@ export async function getContainerInfo(): Promise<ContainerInfo> {
     if (state === "running") {
       try {
         const stats = await run(
-          [
-            "stats",
-            containerName,
-            "--no-stream",
-            "--format",
-            "{{.CPUPerc}}\t{{.MemUsage}}",
-          ],
+          ["stats", containerName, "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}"],
           10_000,
         );
         const [cpu, mem] = stats.split("\t");
         cpuUsage = cpu?.trim() ?? null;
         memoryUsage = mem?.trim() ?? null;
-      } catch {
-        /* stats not available */
-      }
+      } catch { /* stats not available */ }
     }
 
     return {
-      id: id?.slice(0, 12) ?? "",
-      name: containerName,
-      state,
-      image: image ?? "",
-      created: created ?? "",
+      id: id?.slice(0, 12) ?? "", name: containerName, state,
+      image: image ?? "", created: created ?? "",
       uptime: state === "running" ? "running" : null,
-      cpuUsage,
-      memoryUsage,
-      diskUsage: null,
-      networkMode: networkMode ?? "",
-      ports: [],
+      cpuUsage, memoryUsage, diskUsage: null,
+      networkMode: networkMode ?? "", ports: [],
     };
   } catch {
     return {
-      id: "",
-      name: containerName,
-      state,
-      image: "",
-      created: "",
-      uptime: null,
-      cpuUsage: null,
-      memoryUsage: null,
-      diskUsage: null,
-      networkMode: "",
-      ports: [],
+      id: "", name: containerName, state, image: "", created: "",
+      uptime: null, cpuUsage: null, memoryUsage: null, diskUsage: null, networkMode: "", ports: []
     };
   }
 }
 
-/**
- * Update the container's network mode (requires restart).
- */
 export async function updateNetwork(
   mode: NetworkMode,
   opts: Parameters<typeof ensureReady>[0],
 ): Promise<void> {
   const hadContainer = (await getContainerState()) !== "not_found";
+  if (!hadContainer) return;
 
-  if (hadContainer) {
-    const tempImage = `${containerName}-state:latest`;
-    if (opts.persistenceMode === "persistent") {
-      try {
-        await run(["commit", containerName, tempImage], 60_000);
-      } catch {
-        /* best effort */
-      }
-    }
+  const tempImage = `${containerName}-state:latest`;
+  if (opts.persistenceMode === "persistent") {
+    try { await run(["commit", containerName, tempImage], 60_000); } catch { }
+  }
 
-    await destroyContainer();
+  await destroyContainer();
+  const useImage = opts.persistenceMode === "persistent" ? tempImage : opts.image;
+  containerReady = false;
+  await ensureReady({ ...opts, network: mode, image: useImage as any });
 
-    const useImage =
-      opts.persistenceMode === "persistent" ? tempImage : opts.image;
-    const actualOpts = { ...opts, network: mode };
-
-    containerReady = false;
-    await ensureReady({ ...actualOpts, image: useImage as any });
-
-    if (opts.persistenceMode === "persistent") {
-      try {
-        await run(["rmi", tempImage], 10_000);
-      } catch {
-        /* best effort */
-      }
-    }
+  if (opts.persistenceMode === "persistent") {
+    try { await run(["rmi", tempImage], 10_000); } catch { }
   }
 }
 
-/**
- * Check if the container engine is ready.
- */
-export function isReady(): boolean {
-  return containerReady;
-}
+export function isReady(): boolean { return containerReady; }
 
-/**
- * Reset the persistent shell session without touching the container.
- * Useful when the model wants a clean shell (fresh env vars, back to home dir)
- * without a full container rebuild.
- */
 export function resetShellSession(): void {
-  if (shellSession) {
-    shellSession.kill();
-    shellSession = null;
-  }
+  if (shellSession) { shellSession.kill(); shellSession = null; }
 }
 
-/**
- * Verify the container is actually running. If it has been deleted or stopped
- * externally, resets containerReady so ensureReady() will recreate it.
- * Call this at the start of every tool implementation.
- */
 export async function verifyHealth(): Promise<void> {
   if (!containerReady) return;
   try {
@@ -1212,24 +1051,13 @@ export async function verifyHealth(): Promise<void> {
     if (state !== "running") {
       containerReady = false;
       currentNetwork = "none";
-      if (shellSession) {
-        shellSession.kill();
-        shellSession = null;
-      }
+      if (shellSession) { shellSession.kill(); shellSession = null; }
     }
   } catch {
     containerReady = false;
     currentNetwork = "none";
-    if (shellSession) {
-      shellSession.kill();
-      shellSession = null;
-    }
+    if (shellSession) { shellSession.kill(); shellSession = null; }
   }
 }
 
-/**
- * Get the container name.
- */
-export function getContainerName(): string {
-  return containerName;
-}
+export function getContainerName(): string { return containerName; }
