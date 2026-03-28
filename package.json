@@ -1,6 +1,6 @@
 {
   "name": "lms-plugin-computer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Give your local model its own Linux CLI computer. It gets a real isolated container it can run shell commands in, write and read files, install packages, manage processes, and run background tasks - all without touching your host system.",
   "main": "dist/index.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.14.8",
-    "typescript": "^5.4.5"
+    "@types/node": "^22.19.11",
+    "typescript": "^5.9.3"
   }
 }
