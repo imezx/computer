@@ -34,8 +34,8 @@ lms install khtsly/computer
 
 Or from source:
 ```bash
-git clone https://github.com/khtsly/lms-plugin-computer
-cd lms-plugin-computer
+git clone https://github.com/khtsly/computer
+cd computer
 bun run dev   # or: npm run dev
 ```
 
